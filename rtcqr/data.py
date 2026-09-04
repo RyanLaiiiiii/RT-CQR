@@ -1,30 +1,56 @@
 """Data loading and windowing for the LG 18650HG2 Li-ion battery dataset.
 
-The Kaggle mirror (aditya9790/lg-18650hg2-liion-battery-data) republishes
-Kollmeyer et al.'s LG HG2 drive-cycle test logs as one CSV per test file,
-grouped into folders by test temperature (e.g. "0degC", "25degC", "n10degC").
-Column names differ slightly across re-exports of this dataset, so this
-module auto-detects voltage/current/temperature/time/SoC columns by keyword
-instead of hard-coding a schema. If auto-detection ever picks the wrong
-column for your copy of the dataset, run `python -m rtcqr.data inspect
-<path>` to print the detected mapping per file and override it with the
-`column_overrides` argument.
+Real exports of this dataset (as confirmed from a sample file,
+`585_C20DisCh.csv`) are battery-cycler exports, not plain flat CSVs:
+
+    Measurement ID,585
+    Battery Name,LG HG2 18650_SN62A4
+    ...
+    Nominal Capacity, 3
+    ...
+    Time Stamp,Step,Status,Prog Time,Step Time,Cycle,Cycle Level,Procedure,Voltage,Current,Temperature,Capacity,WhAccu,Cnt,
+    ,,,,,,,,[V],[A],[C],[Ah],[Wh],[Cnt],
+    11/27/2018 8:41:18 PM,22,DCH,25:19:08.386,00:01:00.004,0,0,LG_HG2_NN_Char,4.16273,-0.15325,-0.42063,-0.00253,-0.01052,13.00000,
+
+i.e. ~20-30 metadata lines, then the real header row, then a units row,
+then the data. Each file is one measurement/test section (filenames look
+like "<id>_<TestSection>.csv", e.g. "585_C20DisCh.csv" for a C/20 discharge
+capacity-characterization run, or "596_LA92.csv" for a dynamic drive-cycle
+profile). `_read_measurement_csv` locates and skips the preamble/units rows
+automatically; `discover_csv_files` can additionally filter out
+non-drive-cycle characterization sections (C/20 charge-discharge, OCV,
+HPPC, ...) that aren't representative of the dynamic operating conditions
+the paper evaluates on.
+
+Column names can still differ slightly across re-exports, so voltage /
+current / temperature / time / capacity / SoC columns are auto-detected by
+keyword rather than hard-coded. Run `python -m rtcqr.data inspect <path>`
+to print the detected mapping and a parsed summary (row count, time span,
+SoC range) for every file, and pass `column_overrides` to
+`load_lg_hg2_dataframe` to fix any file where detection guesses wrong.
 
 State of charge:
-    If the file already has a SoC-like column, it is used directly
-    (rescaled to [0, 1] if it looks like a percentage). Otherwise SoC is
-    obtained by coulomb counting against the cell's rated capacity (3.0 Ah
-    for the LG HG2), starting from a full charge at the beginning of each
-    test file:
+    1. If the file already has a SoC-like column, it is used directly
+       (rescaled to [0, 1] if it looks like a percentage).
+    2. Else, if it has a cumulative Capacity[Ah] column (as above), SoC is
+       derived from it: SoC(t) = SoC(0) + current_sign * Capacity(t) / Q_rated.
+       This is preferred over re-integrating current with a coarse or
+       irregular timestamp, since the cycler's own coulomb counter is used.
+    3. Else SoC is obtained by coulomb counting the current signal:
+           SoC(t) = SoC(0) + (1 / Q_rated) * cumsum(I(t) * dt)
 
-        SoC(t) = SoC(0) + (1 / Q_rated) * cumsum(I(t) * dt)
+    All three assume SoC(0) = 1.0, i.e. that each exported test-section
+    file begins right after a full charge -- the standard protocol for
+    these drive-cycle/characterization benchmark logs. Pass a different
+    `soc_initial` to `load_lg_hg2_dataframe` if that does not hold for your
+    files.
 
-    using the charge-positive current sign convention (I > 0 = charging).
-    Set `current_sign=-1` in `load_lg_hg2_dataframe` if a given file uses
-    the opposite convention (I > 0 = discharging) -- this is easy to check
-    since the drive-cycle current should be predominantly negative and SoC
-    should trend downward over a discharge test when the convention is
-    right.
+    The default `current_sign=1.0` assumes I > 0 = charging (matches the
+    sample file: current and Capacity are both negative during the DCH
+    section, so SoC decreases as expected). Set `current_sign=-1` if a
+    different export uses the opposite convention -- check with
+    `python -m rtcqr.data inspect`, which prints the SoC range and trend
+    per file.
 """
 from __future__ import annotations
 
@@ -45,6 +71,12 @@ _KEYWORDS = {
     "capacity": ["capacity", "ah accu", "ah_accu"],
     "soc": ["soc", "state of charge", "stateofcharge"],
 }
+
+# Filename substrings (case-insensitive) identifying static characterization
+# test sections rather than dynamic drive-cycle profiles. These have very
+# different current dynamics (slow constant-current or pulse tests) from
+# the driving conditions the paper models, so they are excluded by default.
+_DEFAULT_EXCLUDE_PATTERNS = ["c20", "c/20", "ocv", "hppc", "pulse", "eis", "reset"]
 
 
 def download_lg_hg2(dataset_slug: str = "aditya9790/lg-18650hg2-liion-battery-data") -> str:
@@ -92,14 +124,91 @@ def _extract_temperature_c(folder_name: str) -> Optional[float]:
     return sign * float(m.group(2))
 
 
-def discover_csv_files(root: str) -> List[str]:
+def _find_header_row(path: str, max_scan: int = 100) -> Optional[int]:
+    """Scan the first `max_scan` lines for the real header row, identified as
+    the first line containing "voltage", "current", and some form of "time"
+    all as separate CSV fields. Cycler exports typically have ~20-30 lines
+    of "Key,Value" metadata before this row; a plain flat CSV has it on
+    line 0."""
+    with open(path, "r", errors="ignore") as f:
+        for i, line in enumerate(f):
+            if i >= max_scan:
+                break
+            low = line.lower()
+            if "voltage" in low and "current" in low and "time" in low:
+                return i
+    return None
+
+
+def _read_measurement_csv(path: str) -> pd.DataFrame:
+    header_idx = _find_header_row(path)
+    df = pd.read_csv(path) if header_idx is None else pd.read_csv(path, skiprows=header_idx)
+
+    # Drop columns auto-named by pandas from a trailing comma in the header.
+    df = df.loc[:, ~df.columns.astype(str).str.match(r"^Unnamed")]
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Drop a units row (e.g. ",,,,,,,,[V],[A],[C],[Ah],...") immediately
+    # following the header, if present.
+    if len(df) > 0:
+        first_row_text = " ".join(str(v) for v in df.iloc[0].tolist())
+        if "[" in first_row_text and "]" in first_row_text:
+            df = df.iloc[1:].reset_index(drop=True)
+    return df
+
+
+def _matches_any(text: str, patterns: Sequence[str]) -> bool:
+    low = text.lower()
+    return any(p.lower() in low for p in patterns)
+
+
+def discover_csv_files(
+    root: str,
+    exclude_patterns: Optional[Sequence[str]] = _DEFAULT_EXCLUDE_PATTERNS,
+) -> List[str]:
+    """List CSV files under `root`, optionally filtering out filenames that
+    match `exclude_patterns` (case-insensitive substrings). Pass
+    `exclude_patterns=None` or `[]` to keep every file, e.g. to include
+    static characterization tests alongside dynamic drive cycles."""
     files = sorted(glob.glob(os.path.join(root, "**", "*.csv"), recursive=True))
     if not files:
         raise FileNotFoundError(f"No CSV files found under {root!r}.")
+    if exclude_patterns:
+        kept = [f for f in files if not _matches_any(os.path.basename(f), exclude_patterns)]
+        skipped = len(files) - len(kept)
+        if skipped:
+            print(f"[rtcqr.data] Excluded {skipped} non-drive-cycle file(s) matching {list(exclude_patterns)} "
+                  f"(pass exclude_patterns=None to include everything).")
+        files = kept
+        if not files:
+            raise FileNotFoundError(
+                f"All CSV files under {root!r} were excluded by exclude_patterns={list(exclude_patterns)}."
+            )
     return files
 
 
-def _compute_soc(
+_KNOWN_DATETIME_FORMATS = ["%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %H:%M:%S"]
+
+
+def _parse_time_seconds(raw: pd.Series) -> np.ndarray:
+    """Convert a time column to elapsed seconds from the first sample.
+    Handles both an absolute "Time Stamp" datetime column and an
+    already-numeric seconds column."""
+    dt = None
+    for fmt in _KNOWN_DATETIME_FORMATS:
+        parsed = pd.to_datetime(raw, format=fmt, errors="coerce")
+        if parsed.notna().mean() > 0.5:
+            dt = parsed
+            break
+    if dt is None:
+        dt = pd.to_datetime(raw, errors="coerce")
+    if dt.notna().mean() > 0.5:
+        first_valid = dt.dropna().iloc[0]
+        return (dt - first_valid).dt.total_seconds().to_numpy(dtype=float)
+    return pd.to_numeric(raw, errors="coerce").to_numpy(dtype=float)
+
+
+def _compute_soc_from_current(
     time_s: np.ndarray,
     current_a: np.ndarray,
     rated_capacity_ah: float,
@@ -114,6 +223,14 @@ def _compute_soc(
     return np.clip(soc, 0.0, 1.0)
 
 
+def _compute_soc_from_capacity(
+    capacity_ah: np.ndarray, rated_capacity_ah: float, current_sign: float, soc_initial: float
+) -> np.ndarray:
+    capacity_ah = pd.Series(capacity_ah).interpolate(limit_direction="both").to_numpy()
+    soc = soc_initial + current_sign * capacity_ah / rated_capacity_ah
+    return np.clip(soc, 0.0, 1.0)
+
+
 @dataclass
 class BatteryFile:
     path: str
@@ -125,20 +242,22 @@ def load_lg_hg2_dataframe(
     root: str,
     rated_capacity_ah: float = 3.0,
     current_sign: float = 1.0,
+    soc_initial: float = 1.0,
+    exclude_patterns: Optional[Sequence[str]] = _DEFAULT_EXCLUDE_PATTERNS,
     column_overrides: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> List[BatteryFile]:
-    """Load every drive-cycle CSV under `root` into a list of BatteryFile.
+    """Load every (non-excluded) CSV under `root` into a list of BatteryFile.
 
     `column_overrides` maps a filename (basename) to a per-field column-name
     override dict, for files where auto-detection needs help, e.g.:
         {"553_Mixed2.csv": {"current": "Current(A)"}}
     """
     column_overrides = column_overrides or {}
-    files = discover_csv_files(root)
+    files = discover_csv_files(root, exclude_patterns=exclude_patterns)
     out: List[BatteryFile] = []
     for path in files:
         try:
-            df = pd.read_csv(path)
+            df = _read_measurement_csv(path)
         except Exception as exc:  # pragma: no cover - defensive I/O guard
             print(f"[rtcqr.data] Skipping unreadable file {path}: {exc}")
             continue
@@ -153,28 +272,48 @@ def load_lg_hg2_dataframe(
                   f"Detected mapping: {cols}. Pass column_overrides to fix.")
             continue
 
-        time_s = pd.to_numeric(df[cols["time"]], errors="coerce").to_numpy(dtype=float)
+        time_s = _parse_time_seconds(df[cols["time"]])
         voltage = pd.to_numeric(df[cols["voltage"]], errors="coerce").to_numpy(dtype=float)
         current = pd.to_numeric(df[cols["current"]], errors="coerce").to_numpy(dtype=float)
         temperature = pd.to_numeric(df[cols["temperature"]], errors="coerce").to_numpy(dtype=float)
+        capacity = (
+            pd.to_numeric(df[cols["capacity"]], errors="coerce").to_numpy(dtype=float)
+            if cols["capacity"] is not None else None
+        )
+        soc_col = (
+            pd.to_numeric(df[cols["soc"]], errors="coerce").to_numpy(dtype=float)
+            if cols["soc"] is not None else None
+        )
 
         valid = np.isfinite(time_s) & np.isfinite(voltage) & np.isfinite(current) & np.isfinite(temperature)
-        time_s, voltage, current, temperature = (a[valid] for a in (time_s, voltage, current, temperature))
-        if len(time_s) < 10:
+        if valid.sum() < 10:
+            print(f"[rtcqr.data] Skipping {path}: fewer than 10 valid rows after parsing.")
             continue
+
+        time_s, voltage, current, temperature = (a[valid] for a in (time_s, voltage, current, temperature))
+        if capacity is not None:
+            capacity = capacity[valid]
+        if soc_col is not None:
+            soc_col = soc_col[valid]
 
         order = np.argsort(time_s, kind="stable")
         time_s, voltage, current, temperature = (a[order] for a in (time_s, voltage, current, temperature))
+        if capacity is not None:
+            capacity = capacity[order]
+        if soc_col is not None:
+            soc_col = soc_col[order]
 
-        if cols["soc"] is not None:
-            soc = pd.to_numeric(df[cols["soc"]], errors="coerce").to_numpy(dtype=float)[valid][order]
+        if soc_col is not None and np.isfinite(soc_col).mean() > 0.5:
+            soc = soc_col
             if np.nanmax(soc) > 1.5:  # looks like a percentage
                 soc = soc / 100.0
             soc = np.clip(soc, 0.0, 1.0)
             if np.isnan(soc).any():
                 soc = pd.Series(soc).interpolate(limit_direction="both").to_numpy()
+        elif capacity is not None and np.isfinite(capacity).mean() > 0.5:
+            soc = _compute_soc_from_capacity(capacity, rated_capacity_ah, current_sign, soc_initial)
         else:
-            soc = _compute_soc(time_s, current, rated_capacity_ah, current_sign, soc_initial=1.0)
+            soc = _compute_soc_from_current(time_s, current, rated_capacity_ah, current_sign, soc_initial)
 
         condition = _extract_temperature_c(os.path.basename(os.path.dirname(path)))
         frame = pd.DataFrame(
@@ -255,15 +394,37 @@ class Standardizer:
         return (x - self.mean_) / self.std_
 
 
+def _inspect(root: str, include_all: bool) -> None:
+    exclude = None if include_all else _DEFAULT_EXCLUDE_PATTERNS
+    files = discover_csv_files(root, exclude_patterns=exclude)
+    for path in files:
+        print(path)
+        try:
+            df = _read_measurement_csv(path)
+            cols = detect_columns(df)
+            print("  columns:", list(df.columns))
+            print("  detected:", cols)
+            missing = [k for k in ("time", "voltage", "current", "temperature") if cols[k] is None]
+            if missing:
+                print(f"  WARNING: missing {missing}, this file will be skipped by load_lg_hg2_dataframe")
+                continue
+            time_s = _parse_time_seconds(df[cols["time"]])
+            voltage = pd.to_numeric(df[cols["voltage"]], errors="coerce")
+            current = pd.to_numeric(df[cols["current"]], errors="coerce")
+            valid = np.isfinite(time_s) & voltage.notna().to_numpy() & current.notna().to_numpy()
+            n_valid = int(valid.sum())
+            span_h = (np.nanmax(time_s[valid]) - np.nanmin(time_s[valid])) / 3600.0 if n_valid else float("nan")
+            print(f"  rows={len(df)} valid={n_valid} time_span_h={span_h:.2f} "
+                  f"voltage=[{voltage.min():.3f},{voltage.max():.3f}] current=[{current.min():.3f},{current.max():.3f}]")
+        except Exception as exc:  # pragma: no cover - inspection convenience only
+            print(f"  ERROR parsing file: {exc}")
+
+
 if __name__ == "__main__":
     import sys
 
     if len(sys.argv) >= 3 and sys.argv[1] == "inspect":
-        root = sys.argv[2]
-        for path in discover_csv_files(root):
-            df = pd.read_csv(path, nrows=5)
-            print(path)
-            print("  columns:", list(df.columns))
-            print("  detected:", detect_columns(df))
+        include_all = "--include-all" in sys.argv[3:]
+        _inspect(sys.argv[2], include_all=include_all)
     else:
-        print("Usage: python -m rtcqr.data inspect <dataset_root>")
+        print("Usage: python -m rtcqr.data inspect <dataset_root> [--include-all]")

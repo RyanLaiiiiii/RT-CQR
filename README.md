@@ -54,24 +54,52 @@ print("Path to dataset files:", path)
 python train.py --data-root "$path" --output-dir outputs
 ```
 
-### If column auto-detection doesn't match your copy of the dataset
+### File format
 
-Kaggle re-uploads of this dataset vary slightly in header naming. Inspect
-what was detected before training:
+Confirmed against an actual sample file (`585_C20DisCh.csv`), each CSV in
+this dataset is a raw battery-cycler export: ~20-30 lines of
+`Key,Value` metadata (battery name, nominal capacity, ...), then the real
+header row (`Time Stamp,Step,Status,...,Voltage,Current,Temperature,
+Capacity,...`), then a units row (`,,,,,,,,[V],[A],[C],[Ah],...`), then the
+data. `rtcqr/data.py` locates and skips the preamble/units rows
+automatically -- you don't need to pre-clean the files.
+
+Filenames follow `<measurement_id>_<TestSection>.csv`. Some sections are
+static characterization tests (e.g. `C20DisCh` = C/20 constant-current
+discharge, used to build an OCV-SoC curve) rather than the dynamic
+drive-cycle profiles (`UDDS`, `LA92`, `US06`, `Mixed*`, ...) the paper
+evaluates on. By default, `discover_csv_files`/`load_lg_hg2_dataframe`
+exclude filenames matching `c20`, `ocv`, `hppc`, `pulse`, `eis`, `reset`
+(case-insensitive); pass `--include-all` to `train.py` (or
+`exclude_patterns=None` to `load_lg_hg2_dataframe`) to keep everything.
+
+Inspect what gets detected and parsed, per file, before training:
 
 ```bash
-python -m rtcqr.data inspect /path/to/lg_hg2
+python -m rtcqr.data inspect /path/to/lg_hg2            # drive-cycle files only
+python -m rtcqr.data inspect /path/to/lg_hg2 --include-all  # + characterization tests
 ```
 
-If a file's voltage/current/temperature/time columns aren't picked up
-correctly, pass `column_overrides` to `load_lg_hg2_dataframe` (see
-`rtcqr/data.py`) mapping that file's basename to the right column names.
+This prints the detected column mapping plus a parsed summary (row count,
+time span, voltage/current range) so you can sanity-check a file without
+opening it. If a file's voltage/current/temperature/time columns aren't
+picked up correctly, pass `column_overrides` to `load_lg_hg2_dataframe`
+(see `rtcqr/data.py`) mapping that file's basename to the right column
+names.
 
 If the dataset already ships a SoC column it is used as-is (rescaled from
-percent if needed); otherwise SoC is obtained by coulomb counting against
-the LG HG2's rated 3.0 Ah capacity, assuming `current > 0` means charging.
-If a file's computed SoC trends the wrong way (e.g. increasing SoC during a
-drive-cycle discharge), pass `--current-sign -1.0`.
+percent if needed). Otherwise, if it has a cumulative `Capacity[Ah]` column
+(as in the sample file), SoC is derived from that directly, since it's the
+cycler's own coulomb counter and more accurate than re-integrating current
+against timestamps. Failing that, SoC is obtained by coulomb counting the
+current signal. All three assume each test-section file starts right after
+a full charge (`SoC(0) = 1.0`, confirmed on the sample file: SoC starts at
+0.999 and decreases smoothly to ~0.13 over the discharge) and that
+`current > 0` means charging (also confirmed on the sample: current and
+`Capacity` are both negative throughout the discharge, and SoC decreases as
+expected). If a different file's computed SoC trends the wrong way, pass
+`--current-sign -1.0`; if a file doesn't start from a full charge, pass a
+different `soc_initial` to `load_lg_hg2_dataframe`.
 
 ## Training and evaluation
 

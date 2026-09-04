@@ -31,7 +31,13 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from rtcqr.baselines import make_cqr_calibrator, make_rtcqr_calibrator, make_wcp_calibrator
 from rtcqr.config import RTCQRConfig
-from rtcqr.data import Standardizer, chronological_split, load_lg_hg2_dataframe, make_windows
+from rtcqr.data import (
+    Standardizer,
+    _DEFAULT_EXCLUDE_PATTERNS,
+    chronological_split,
+    load_lg_hg2_dataframe,
+    make_windows,
+)
 from rtcqr.losses import composite_quantile_loss
 from rtcqr.metrics import summarize
 from rtcqr.model import TCNQuantileNet
@@ -44,8 +50,12 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float):
-    files = load_lg_hg2_dataframe(data_root, rated_capacity_ah=cfg.rated_capacity_ah, current_sign=current_sign)
+def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include_all: bool = False):
+    exclude_patterns = None if include_all else _DEFAULT_EXCLUDE_PATTERNS
+    files = load_lg_hg2_dataframe(
+        data_root, rated_capacity_ah=cfg.rated_capacity_ah, current_sign=current_sign,
+        exclude_patterns=exclude_patterns,
+    )
     print(f"[rtcqr.train] Loaded {len(files)} drive-cycle files from {data_root}")
 
     train_frames, val_frames, test_frames = chronological_split(files, cfg.train_frac, cfg.val_frac)
@@ -198,6 +208,9 @@ def main():
     parser.add_argument("--download", action="store_true", help="Download the dataset via kagglehub first.")
     parser.add_argument("--dataset-slug", type=str, default="aditya9790/lg-18650hg2-liion-battery-data")
     parser.add_argument("--current-sign", type=float, default=1.0, help="1.0 if I>0 means charging, -1.0 if I>0 means discharging.")
+    parser.add_argument("--include-all", action="store_true",
+                         help="Include static characterization test sections (C/20, OCV, HPPC, ...) instead of "
+                              "only dynamic drive-cycle profiles.")
     parser.add_argument("--calibrators", nargs="+", default=["rtcqr", "cqr", "wcp"], choices=["rtcqr", "cqr", "wcp"])
     parser.add_argument("--no-ltr", action="store_true", help="Ablation: disable the lower-tail regularizer (lambda_l=0).")
     parser.add_argument("--max-epochs", type=int, default=None)
@@ -229,7 +242,7 @@ def main():
             raise SystemExit("Provide --data-root <path> or pass --download to fetch it via kagglehub.")
         data_root = args.data_root
 
-    splits = build_windows(cfg, data_root, current_sign=args.current_sign)
+    splits = build_windows(cfg, data_root, current_sign=args.current_sign, include_all=args.include_all)
 
     t0 = time.time()
     model = train_model(cfg, splits, device)
