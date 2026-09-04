@@ -181,17 +181,6 @@ python train.py --data-root /path/to/lg_hg2 --calibrators cqr --output-dir outpu
 - `--calibrators rtcqr cqr wcp` — which calibration methods to report.
 - `--max-epochs`, `--patience`, `--seed` — training controls.
 
-## Smoke-testing without the real dataset
-
-`tests/make_synthetic_dataset.py` generates a tiny synthetic dataset with
-the same folder/column layout as the Kaggle mirror, useful for verifying
-the pipeline runs end-to-end without network access:
-
-```bash
-python tests/make_synthetic_dataset.py /tmp/synthetic_lg_hg2
-python train.py --data-root /tmp/synthetic_lg_hg2 --window-size 20 --max-epochs 3
-```
-
 ## Method summary
 
 1. **Risk-aligned quantile learning** (eq. 16-18): a TCN jointly predicts
