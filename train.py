@@ -124,6 +124,7 @@ def train_model(cfg: RTCQRConfig, splits, device: torch.device) -> TCNQuantileNe
         dropout=cfg.dropout,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
 
     best_val = float("inf")
     best_state = None
@@ -155,8 +156,10 @@ def train_model(cfg: RTCQRConfig, splits, device: torch.device) -> TCNQuantileNe
                 )
                 val_loss += loss.item() * xb.size(0)
         val_loss /= len(val_ds)
+        scheduler.step(val_loss)
 
-        print(f"[rtcqr.train] epoch {epoch:03d}  train_loss={train_loss:.5f}  val_loss={val_loss:.5f}")
+        lr = optimizer.param_groups[0]["lr"]
+        print(f"[rtcqr.train] epoch {epoch:03d}  train_loss={train_loss:.5f}  val_loss={val_loss:.5f}  lr={lr:.2e}")
 
         if val_loss < best_val - 1e-6:
             best_val = val_loss

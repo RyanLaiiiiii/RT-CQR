@@ -65,6 +65,19 @@ class TCNQuantileNet(nn.Module):
     Input:  (batch, in_channels, seq_len)
     Output: (batch, len(quantile_levels)), the estimated conditional
             quantiles of SoC at the *last* time step of the input window.
+
+    The head is parameterized to make quantile crossing structurally
+    impossible rather than merely discouraged: it outputs the lowest
+    quantile directly, plus a softplus'd (>=0) increment for each
+    subsequent quantile_levels entry, so q[k] = q[k-1] + softplus(raw[k]) is
+    non-decreasing by construction. `losses.quantile_crossing_penalty`
+    (lambda_nc in the composite loss) only *penalizes* crossing after the
+    fact, which observably wasn't enough on its own -- on the real LG HG2
+    data, once SoC genuinely spans the full [0,1] range (down to ~0 near
+    depletion, see rtcqr/data.py's per-condition capacity normalization),
+    the fitted quantile-crossing rate was ~14-15% despite lambda_nc=1.0.
+    `quantile_levels` must be sorted ascending, matching the paper's
+    T = {tau_1 < ... < tau_|T|}.
     """
 
     def __init__(
@@ -91,4 +104,7 @@ class TCNQuantileNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.tcn(x)          # (batch, channels, seq_len)
         h_last = h[:, :, -1]     # representation at the current (last) time step
-        return self.head(h_last)  # (batch, num_quantiles)
+        raw = self.head(h_last)  # (batch, num_quantiles)
+        base = raw[:, :1]
+        increments = torch.nn.functional.softplus(raw[:, 1:])
+        return torch.cat([base, base + torch.cumsum(increments, dim=1)], dim=1)

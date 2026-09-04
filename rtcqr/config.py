@@ -41,7 +41,12 @@ class RTCQRConfig:
     weight_decay: float = 0.0
     batch_size: int = 64
     max_epochs: int = 200
-    patience: int = 15
+    # 20, not the original 15: with the ReduceLROnPlateau scheduler (factor=0.5,
+    # patience=5) in train_model, 15 epochs of no improvement left room for at
+    # most one LR drop before early stopping; 20 lets it try ~2-3 drops, giving
+    # the optimizer a chance to settle after the val_loss got noisier once SoC
+    # started spanning the full [0,1] range (see rtcqr/data.py's capacity fix).
+    patience: int = 20
 
     # --- Composite loss, eq. (17) ---
     lambda_nc: float = 1.0  # quantile-crossing penalty weight
