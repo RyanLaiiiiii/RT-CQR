@@ -57,3 +57,44 @@ print(df.to_string(index=False, float_format=lambda v: f"{v:.3f}"))
 print("\n\nCampaign order (does the low condition simply come last?):\n")
 print(df.sort_values("when")[["when", "cond", "meas", "ah", "hours", "v_start"]]
         .to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+
+# --------------------------------------------------------------------------
+# Termination voltage: the check a normal duration cannot catch.
+# --------------------------------------------------------------------------
+# Internal resistance falls as a cell warms, so a warmer cell holds its
+# voltage up longer under the same load and reaches a fixed cutoff later.
+# v_end must therefore DECREASE monotonically with temperature. A condition
+# that stops well above a colder one ran out of file, not out of charge: its
+# section was cut short even though it lasted a normal ~1 h -- exactly the
+# case a duration guard cannot see.
+print("\n\nTermination voltage vs. temperature (v_end must fall as temp rises):\n")
+per = df.groupby("cond").agg(v_end=("v_end", "mean"), ah=("ah", "mean"),
+                             hours=("hours", "mean"), n=("ah", "size")).sort_index()
+print(per.to_string(float_format=lambda v: f"{v:.3f}"))
+
+conds = list(per.index)
+flagged = []
+for warm in conds:
+    colder = [c for c in conds if c < warm]
+    if not colder:
+        continue
+    deepest_cold = min(colder, key=lambda c: per.loc[c, "v_end"])
+    dv = per.loc[warm, "v_end"] - per.loc[deepest_cold, "v_end"]
+    if dv > 0.05:
+        flagged.append((warm, deepest_cold, dv))
+
+print()
+if flagged:
+    for warm, cold, dv in flagged:
+        print(f"SUSPECT  {warm} degC terminated at {per.loc[warm, 'v_end']:.3f} V, {dv * 1000:.0f} mV ABOVE")
+        print(f"         the colder {cold} degC ({per.loc[cold, 'v_end']:.3f} V). A warmer cell has lower")
+        print(f"         internal resistance and should discharge DEEPER, not stop earlier, so its")
+        print(f"         {per.loc[warm, 'ah']:.3f} Ah is an UNDER-estimate: the section ended before the")
+        print(f"         discharge finished. Duration was {per.loc[warm, 'hours']:.3f} h, i.e. normal, which")
+        print(f"         is why the truncation guard in _measured_capacity_ah does not catch it.")
+        print(f"         Estimate from the datasheet ratio against {cold} degC ({per.loc[cold, 'ah']:.3f} Ah):")
+        print(f"             capacity_overrides={{{warm}: {per.loc[cold, 'ah'] * 1.015:.2f}}}")
+        print()
+else:
+    print("OK  termination voltage falls monotonically with temperature; no section")
+    print("    appears to have stopped early.")
