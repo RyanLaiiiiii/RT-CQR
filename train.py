@@ -106,7 +106,20 @@ def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include
     }
 
 
-def train_model(cfg: RTCQRConfig, splits, device: torch.device) -> TCNQuantileNet:
+def train_model(
+    cfg: RTCQRConfig, splits, device: torch.device, checkpoint_path: Optional[str] = None,
+) -> TCNQuantileNet:
+    """Train the quantile model. If `checkpoint_path` is given and already
+    exists, resumes from it (model/optimizer/scheduler state, best-so-far
+    tracking, and epoch count) instead of starting over -- meant for
+    environments like a free-tier Colab GPU that can kill the runtime
+    mid-run (daily usage cap, idle timeout) with no warning. A checkpoint is
+    (over)written to `checkpoint_path` after every epoch, so at most one
+    epoch of progress is ever lost. Note this only survives a *process*
+    restart within the same filesystem: on Colab, `checkpoint_path` must
+    point somewhere that outlives the VM being recycled (e.g. a path under
+    a mounted Google Drive), not the local, ephemeral `/content` disk.
+    """
     X_train, y_train = splits["train"]
     X_val, y_val = splits["val"]
 
@@ -126,11 +139,24 @@ def train_model(cfg: RTCQRConfig, splits, device: torch.device) -> TCNQuantileNe
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
 
+    start_epoch = 1
     best_val = float("inf")
     best_state = None
     epochs_no_improve = 0
 
-    for epoch in range(1, cfg.max_epochs + 1):
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        ckpt = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+        best_val = ckpt["best_val"]
+        best_state = ckpt["best_state"]
+        epochs_no_improve = ckpt["epochs_no_improve"]
+        start_epoch = ckpt["epoch"] + 1
+        print(f"[rtcqr.train] resuming from {checkpoint_path}: epoch {start_epoch}, "
+              f"best_val={best_val:.5f}, epochs_no_improve={epochs_no_improve}")
+
+    for epoch in range(start_epoch, cfg.max_epochs + 1):
         model.train()
         train_loss = 0.0
         for xb, yb in train_loader:
@@ -167,9 +193,22 @@ def train_model(cfg: RTCQRConfig, splits, device: torch.device) -> TCNQuantileNe
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
-            if epochs_no_improve >= cfg.patience:
-                print(f"[rtcqr.train] early stopping at epoch {epoch} (best val_loss={best_val:.5f})")
-                break
+
+        if checkpoint_path:
+            os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
+            torch.save({
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "best_val": best_val,
+                "best_state": best_state,
+                "epochs_no_improve": epochs_no_improve,
+            }, checkpoint_path)
+
+        if epochs_no_improve >= cfg.patience:
+            print(f"[rtcqr.train] early stopping at epoch {epoch} (best val_loss={best_val:.5f})")
+            break
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -253,6 +292,17 @@ def main():
                               "measurement run before windowing (default 1.0). Pass 0 to disable resampling.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default="outputs")
+    parser.add_argument("--checkpoint-path", type=str, default=None,
+                         help="Where to save/resume the mid-training checkpoint (default: "
+                              "<output-dir>/checkpoint.pt). If it already exists, training resumes from it "
+                              "automatically -- pass --no-resume to ignore it and start over. On Colab, point "
+                              "this at a path under a mounted Google Drive (e.g. "
+                              "/content/drive/MyDrive/rtcqr_outputs/checkpoint.pt), not the local /content disk: "
+                              "the runtime being recycled (daily usage cap, idle timeout) wipes local files, so a "
+                              "checkpoint saved only there won't survive it.")
+    parser.add_argument("--no-resume", action="store_true",
+                         help="Ignore an existing checkpoint at --checkpoint-path and start training from scratch "
+                              "(it will still be overwritten with fresh progress as training proceeds).")
     args = parser.parse_args()
 
     cfg = RTCQRConfig(seed=args.seed)
@@ -282,8 +332,12 @@ def main():
     splits = build_windows(cfg, data_root, current_sign=args.current_sign, include_all=args.include_all,
                             exclude_measurement_ids=args.exclude_measurement_ids, split_mode=args.split_mode)
 
+    checkpoint_path = args.checkpoint_path or os.path.join(args.output_dir, "checkpoint.pt")
+    if args.no_resume and os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+
     t0 = time.time()
-    model = train_model(cfg, splits, device)
+    model = train_model(cfg, splits, device, checkpoint_path=checkpoint_path)
     print(f"[rtcqr.train] training finished in {time.time() - t0:.1f}s")
 
     results = evaluate(cfg, model, splits, device, calibrators=args.calibrators)
