@@ -319,10 +319,25 @@ python train.py --data-root /path/to/lg_hg2 --calibrators cqr --output-dir outpu
   measure before raising it).
 - `--max-epochs`, `--patience`, `--seed` — training controls.
 
+## Checking the labels before you train
+
+The SoC labels are reconstructed, not published (see above), so verify them
+before spending GPU time:
+
+```bash
+python check_soc.py /path/to/lg_hg2
+```
+
+It reports frozen segments (SoC pinned at a clip, the signature of a
+capacity denominator that is too small), per-condition SoC coverage, and
+whether any sample actually falls below `soc_min` -- if none does, LVR is
+trivially 0 for every method and the violation-weighting mechanism is never
+exercised. Exits non-zero when something is wrong, so it works in a script.
+
 ## Tests
 
 ```bash
-pip install pytest && pytest
+pip install -r requirements.txt && pytest
 ```
 
 ## Method summary
