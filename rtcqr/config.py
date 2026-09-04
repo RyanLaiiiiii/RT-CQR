@@ -7,7 +7,7 @@ kernel-size-3 TCN with dropout 0.1, Adam (lr=1e-3, batch size 64), and
 lambda_nc=1.0, lambda_l=0.1, zeta=0.98, gamma=1.0.
 """
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -17,6 +17,18 @@ class RTCQRConfig:
     stride: int = 1
     resample_dt_s: Optional[float] = 1.0  # uniform resampling interval (s) applied before windowing
     rated_capacity_ah: float = 3.0
+    # Per-condition capacity in Ah, replacing whatever was measured from that
+    # condition's Cap_1C section. Needed when a check ran a normal duration
+    # from a full charge but stopped before the discharge finished, which no
+    # single-section guard can detect -- only the cross-condition termination
+    # voltage gives it away (see diag40.py). Recorded in results.json so a run
+    # carries the assumption it was produced under.
+    capacity_overrides: Dict[float, float] = field(default_factory=dict)
+    # Drop segments whose SoC spans less than this. A drive cycle sitting in
+    # the saturated full-charge region has a near-constant label while V/I/T
+    # vary, so it teaches the model nothing and hands the calibrator
+    # degenerate nonconformity scores. 0.0 keeps everything.
+    min_soc_range: float = 0.0
     soc_min: float = 0.10
     # tau in eq. (14)/(17): T = {0.025, 0.05, 0.10, 0.15, 0.85, 0.90, 0.95, 0.975}
     quantile_levels: List[float] = field(

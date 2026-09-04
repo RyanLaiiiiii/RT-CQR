@@ -55,6 +55,39 @@ def set_seed(seed: int):
 # Smallest val_loss decrease treated as real progress. Shared by the LR
 # scheduler and the early-stopping counter so they cannot disagree.
 _MIN_VAL_IMPROVEMENT = 1e-6
+def parse_capacity_overrides(values) -> Dict[float, float]:
+    """Parse ``TEMP:AH`` pairs into {condition_degC: capacity_ah}.
+
+    Accepts a repeated flag and/or comma-separated pairs, and takes the
+    dataset's own ``n20`` spelling for sub-zero temperatures as well as
+    ``-20``. The ``n`` form is worth having: argparse reads a bare
+    ``-20:1.70`` as an option rather than a value, so ``--capacity-override
+    n20:1.70`` works positionally where the minus sign needs
+    ``--capacity-override=-20:1.70``.
+    """
+    out: Dict[float, float] = {}
+    for chunk in values or []:
+        for pair in str(chunk).split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if ":" not in pair:
+                raise argparse.ArgumentTypeError(
+                    f"--capacity-override expects TEMP:AH (e.g. 40:2.75), got {pair!r}")
+            temp_s, cap_s = pair.split(":", 1)
+            temp_s = temp_s.strip()
+            if temp_s[:1].lower() == "n":
+                temp_s = "-" + temp_s[1:]
+            try:
+                temp, cap = float(temp_s), float(cap_s)
+            except ValueError:
+                raise argparse.ArgumentTypeError(
+                    f"--capacity-override expects numbers, got {pair!r}")
+            if not cap > 0:
+                raise argparse.ArgumentTypeError(f"capacity must be positive, got {pair!r}")
+            out[temp] = cap
+    return out
+
 
 
 def _report_split_conditions(train, val, calib, test) -> None:
@@ -86,6 +119,7 @@ def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include
     files = load_lg_hg2_dataframe(
         data_root, rated_capacity_ah=cfg.rated_capacity_ah, current_sign=current_sign,
         include_patterns=include_patterns, resample_dt_s=cfg.resample_dt_s,
+        capacity_overrides=cfg.capacity_overrides, min_soc_range=cfg.min_soc_range,
     )
 
     if exclude_measurement_ids:
@@ -366,6 +400,17 @@ def main():
                          help="DataLoader worker processes for batch assembly (default 0). The dataset is "
                               "already a fully in-RAM TensorDataset, so workers mostly add per-batch pickling "
                               "and IPC rather than removing a bottleneck; raise it only if you measure a gain.")
+    parser.add_argument("--capacity-override", action="append", metavar="TEMP:AH",
+                         help="Override a condition's measured capacity, e.g. --capacity-override 40:2.75. "
+                              "Repeatable, and accepts comma-separated pairs. Use for a Cap_1C section that "
+                              "ran a normal duration from a full charge but stopped before the discharge "
+                              "finished -- run diag40.py to identify one. For sub-zero temperatures write "
+                              "n20:1.70, or use the --capacity-override=-20:1.70 form (a bare -20:1.70 is "
+                              "read as an option, not a value).")
+    parser.add_argument("--min-soc-range", type=float, default=None, metavar="SPAN",
+                         help="Drop segments whose SoC spans less than SPAN (try 0.02). A drive cycle sitting "
+                              "in the saturated full-charge region has a near-constant label while V/I/T vary, "
+                              "so it teaches the model nothing and gives the calibrator degenerate scores.")
     parser.add_argument("--point-baseline", action="store_true",
                          help="Also train the deterministic point-estimation model and report its LVR "
                               "(the 'Point' row of Table II).")
@@ -379,6 +424,11 @@ def main():
     args = parser.parse_args()
 
     cfg = RTCQRConfig(seed=args.seed)
+    cfg.capacity_overrides = parse_capacity_overrides(args.capacity_override)
+    if cfg.capacity_overrides:
+        print(f"[rtcqr.train] capacity overrides: {cfg.capacity_overrides}")
+    if args.min_soc_range is not None:
+        cfg.min_soc_range = args.min_soc_range
     if args.no_stratify:
         cfg.stratify_by_condition = False
     if args.paper_quantile:

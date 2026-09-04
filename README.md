@@ -60,9 +60,40 @@ backwards and means that condition's section is truncated. A denominator
 that is too small is the damaging direction: it drives SoC into the [0, 1]
 clip, freezing whole drive-cycle segments at exactly 0 and, because the clip
 is irreversible, corrupting everything after them in the same run. Check the
-per-condition capacities the loader prints before trusting a training run,
-and override a bad one with `capacity_overrides={40.0: 2.80}` rather than
-falling back to the nominal rating.
+per-condition capacities the loader prints before trusting a training run.
+
+One failure mode survives all of those guards: a check that starts from a
+full charge, has no internal gap, and runs a normal ~1 h, but stops before
+the discharge finishes. Nothing about that section alone gives it away --
+only the *cross-condition* termination voltage does. Internal resistance
+falls as a cell warms, so a warmer cell holds its voltage up under load and
+reaches a fixed cutoff later, which means `v_end` must decrease
+monotonically with temperature. `diag40.py` prints that table and names any
+condition that stops early:
+
+```bash
+python diag40.py /path/to/lg_hg2
+```
+
+On the McMaster data this flags 40 degC, which terminates at 3.254 V --
+182 mV *above* the colder 25 degC (3.072 V), while every other condition
+falls monotonically from -20 degC's 3.571 V. Its 2.496 Ah is therefore an
+under-estimate, not capacity fade (the campaign ran 25 degC before 40 degC,
+ten days apart, so aging cannot explain an 8% drop). Pin it instead of
+letting it fall back to the nominal rating:
+
+```bash
+python train.py --data-root /path/to/lg_hg2 --capacity-override 40:2.75 --min-soc-range 0.02
+```
+
+`--capacity-override` takes `TEMP:AH` pairs, is repeatable, and accepts
+comma-separated pairs. For sub-zero temperatures write `n20:1.70` (the
+dataset's own spelling) or use `--capacity-override=-20:1.70`; a bare
+`-20:1.70` is read by argparse as an option rather than a value. Both
+settings are recorded in `results.json`, so a run carries the assumptions it
+was produced under. `diagnose_calibration.py` takes the same two flags and
+they must match, or its split will not reproduce the one the model was
+trained on.
 
 The dataset is the LG 18650HG2 Li-ion battery cycler data collected by
 Dr. Phillip Kollmeyer at McMaster University, Hamilton, Ontario, Canada
@@ -307,6 +338,10 @@ python train.py --data-root /path/to/lg_hg2 --calibrators cqr --output-dir outpu
 - `--no-stratify` — split without stratifying by temperature. Not
   recommended; see above.
 - `--paper-quantile` — use eq. (25)-(26)'s uncorrected empirical quantile.
+- `--capacity-override TEMP:AH` — pin a condition's capacity (see above).
+- `--min-soc-range SPAN` — drop segments whose SoC spans less than SPAN
+  (try 0.02); these sit in the saturated full-charge region with a
+  near-constant label.
 - `--point-baseline` — also train the deterministic point-estimation model
   and report its LVR (the `Point` row of Table II).
 - `--include-all` — keep static characterization test sections instead of

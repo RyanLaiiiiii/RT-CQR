@@ -21,6 +21,7 @@ from the repo root (same directory as train.py), since it imports from it.
 from __future__ import annotations
 
 import argparse
+from typing import Dict
 
 import numpy as np
 import torch
@@ -30,6 +31,40 @@ from rtcqr.config import RTCQRConfig
 from rtcqr.metrics import summarize
 from rtcqr.model import TCNQuantileNet
 from train import build_windows, predict_quantiles, set_seed
+
+
+def parse_capacity_overrides(values) -> Dict[float, float]:
+    """Parse ``TEMP:AH`` pairs into {condition_degC: capacity_ah}.
+
+    Accepts a repeated flag and/or comma-separated pairs, and takes the
+    dataset's own ``n20`` spelling for sub-zero temperatures as well as
+    ``-20``. The ``n`` form is worth having: argparse reads a bare
+    ``-20:1.70`` as an option rather than a value, so ``--capacity-override
+    n20:1.70`` works positionally where the minus sign needs
+    ``--capacity-override=-20:1.70``.
+    """
+    out: Dict[float, float] = {}
+    for chunk in values or []:
+        for pair in str(chunk).split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if ":" not in pair:
+                raise argparse.ArgumentTypeError(
+                    f"--capacity-override expects TEMP:AH (e.g. 40:2.75), got {pair!r}")
+            temp_s, cap_s = pair.split(":", 1)
+            temp_s = temp_s.strip()
+            if temp_s[:1].lower() == "n":
+                temp_s = "-" + temp_s[1:]
+            try:
+                temp, cap = float(temp_s), float(cap_s)
+            except ValueError:
+                raise argparse.ArgumentTypeError(
+                    f"--capacity-override expects numbers, got {pair!r}")
+            if not cap > 0:
+                raise argparse.ArgumentTypeError(f"capacity must be positive, got {pair!r}")
+            out[temp] = cap
+    return out
 
 
 def describe(name: str, values: np.ndarray) -> str:
@@ -52,6 +87,11 @@ def main():
     parser.add_argument("--window-size", type=int, default=None)
     parser.add_argument("--resample-dt", type=float, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--capacity-override", action="append", metavar="TEMP:AH",
+                        help="Must match what train.py was run with, or the SoC labels differ from the "
+                             "ones the loaded model was trained against.")
+    parser.add_argument("--min-soc-range", type=float, default=None, metavar="SPAN",
+                        help="Must match what train.py was run with, or the split will not reproduce.")
     parser.add_argument("--no-stratify", action="store_true",
                         help="Must match the flag train.py was run with, or the split will not "
                              "reproduce and the loaded model will be evaluated on its own training data.")
@@ -59,6 +99,9 @@ def main():
     args = parser.parse_args()
 
     cfg = RTCQRConfig(seed=args.seed)
+    cfg.capacity_overrides = parse_capacity_overrides(args.capacity_override)
+    if args.min_soc_range is not None:
+        cfg.min_soc_range = args.min_soc_range
     if args.no_stratify:
         cfg.stratify_by_condition = False
     if args.window_size is not None:

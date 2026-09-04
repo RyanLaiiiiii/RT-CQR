@@ -313,3 +313,51 @@ def test_degenerate_segments_are_dropped_when_asked(tmp_path):
 def test_min_soc_range_keeps_healthy_segments(full_dataset):
     assert len(load_lg_hg2_dataframe(full_dataset, min_soc_range=0.02)) == \
            len(load_lg_hg2_dataframe(full_dataset))
+
+
+# --------------------------------------------------------------------------
+# CLI override parsing
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("argv,expected", [
+    (["40:2.75"], {40.0: 2.75}),
+    (["40:2.75", "25:2.71"], {40.0: 2.75, 25.0: 2.71}),
+    (["40:2.75,25:2.71"], {40.0: 2.75, 25.0: 2.71}),
+    (["n20:1.70"], {-20.0: 1.70}),                 # dataset's own spelling
+    (["N20:1.70"], {-20.0: 1.70}),
+    (["-20:1.70"], {-20.0: 1.70}),                 # works via --flag=-20:1.70
+    (["40.0:2.75"], {40.0: 2.75}),
+    ([" 40 : 2.75 "], {40.0: 2.75}),
+    ([], {}),
+    (None, {}),
+])
+def test_parse_capacity_overrides(argv, expected):
+    from train import parse_capacity_overrides
+    assert parse_capacity_overrides(argv) == expected
+
+
+@pytest.mark.parametrize("bad", [["40"], ["40:abc"], ["x:2.7"], ["40:0"], ["40:-1"]])
+def test_parse_capacity_overrides_rejects_junk(bad):
+    import argparse
+    from train import parse_capacity_overrides
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_capacity_overrides(bad)
+
+
+def test_override_reaches_the_soc_labels(tmp_path):
+    """The whole point of the flag: it must change the denominator, not just
+    be recorded in the config."""
+    import datetime as _dt
+    t = _dt.datetime(2018, 11, 20, 8, 0, 0)
+    base = str(tmp_path / "40degC")
+    # A Cap_1C that stops early: full duration, but only 2.0 Ah delivered.
+    t = write_section(f"{base}/700_Cap_1C.csv", "700", "Cap_1C", t, cc(3600, -2.0), 40.0)
+    t = write_section(f"{base}/700_Charge1.csv", "700", "Charge1", t, cc(3600, +2.0), 40.0)
+    write_section(f"{base}/700_UDDS.csv", "700", "UDDS", t, cc(1800, -2.0), 40.0)
+
+    measured = load_lg_hg2_dataframe(str(tmp_path), rated_capacity_ah=3.0)
+    overridden = load_lg_hg2_dataframe(str(tmp_path), rated_capacity_ah=3.0,
+                                       capacity_overrides={40.0: 2.75})
+    # 1.0 Ah out of the drive cycle: 50% of 2.0 Ah, but only 36% of 2.75 Ah.
+    assert measured[0].frame["soc"].iloc[-1] == pytest.approx(0.50, abs=0.02)
+    assert overridden[0].frame["soc"].iloc[-1] == pytest.approx(0.636, abs=0.02)

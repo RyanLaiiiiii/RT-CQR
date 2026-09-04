@@ -28,6 +28,23 @@ import numpy as np
 
 from rtcqr.data import load_lg_hg2_dataframe
 
+def _parse_overrides(values):
+    """TEMP:AH pairs -> {condition: capacity}. `n20` is accepted for -20, since
+    argparse reads a bare `-20:1.70` as an option rather than a value."""
+    out = {}
+    for chunk in values or []:
+        for pair in str(chunk).split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            temp_s, _, cap_s = pair.partition(":")
+            temp_s = temp_s.strip()
+            if temp_s[:1].lower() == "n":
+                temp_s = "-" + temp_s[1:]
+            out[float(temp_s)] = float(cap_s)
+    return out
+
+
 CLIP_EPS = 1e-3
 FROZEN_FRAC = 0.5      # fraction of a segment pinned at a clip to call it frozen
 HEAVY_FRAC = 0.1
@@ -41,6 +58,10 @@ def main() -> int:
                     help="Safety floor used by the LVR metric (default 0.10).")
     ap.add_argument("--min-soc-range", type=float, default=0.0,
                     help="Drop segments whose SoC spans less than this (try 0.02).")
+    ap.add_argument("--capacity-override", action="append", metavar="TEMP:AH",
+                    help="Override a condition's measured capacity, e.g. 40:2.75. Repeatable and accepts "
+                         "comma-separated pairs; write n20:1.70 for sub-zero, or use the "
+                         "--capacity-override=-20:1.70 form.")
     ap.add_argument("--include-all", action="store_true",
                     help="Include static characterization sections, not just drive cycles.")
     args = ap.parse_args()
@@ -48,6 +69,7 @@ def main() -> int:
     print("Loading. The loader's own capacity report follows -- read it first:\n")
     files = load_lg_hg2_dataframe(
         args.data_root, min_soc_range=args.min_soc_range,
+        capacity_overrides=_parse_overrides(args.capacity_override),
         **({"include_patterns": None} if args.include_all else {})
     )
 
