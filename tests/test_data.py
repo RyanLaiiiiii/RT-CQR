@@ -288,3 +288,28 @@ def test_capacity_override_takes_precedence(tmp_path):
     files = load_lg_hg2_dataframe(str(tmp_path), rated_capacity_ah=3.0,
                                   capacity_overrides={25.0: 2.0})
     assert files[0].frame["soc"].iloc[-1] == pytest.approx(0.5, abs=0.02)
+
+
+def test_degenerate_segments_are_dropped_when_asked(tmp_path):
+    """A drive cycle sitting in the saturated full-charge region carries a
+    near-constant label while V/I/T vary, so it teaches nothing and gives
+    the calibrator degenerate nonconformity scores."""
+    import datetime as _dt
+    t = _dt.datetime(2018, 11, 20, 8, 0, 0)
+    base = str(tmp_path / "25degC")
+    # Charge well past full, then a drive cycle that barely moves SoC.
+    t = write_section(f"{base}/950_Charge1.csv", "950", "Charge1", t, cc(7200, +3.0), 25.0)
+    write_section(f"{base}/950_UDDS.csv", "950", "UDDS", t, cc(600, -0.01), 25.0)
+
+    kept = load_lg_hg2_dataframe(str(tmp_path), rated_capacity_ah=3.0)
+    assert len(kept) == 1
+    span = kept[0].frame["soc"].max() - kept[0].frame["soc"].min()
+    assert span < 0.02, "fixture should produce a near-constant-SoC segment"
+
+    with pytest.raises(RuntimeError, match="No usable battery segments"):
+        load_lg_hg2_dataframe(str(tmp_path), rated_capacity_ah=3.0, min_soc_range=0.02)
+
+
+def test_min_soc_range_keeps_healthy_segments(full_dataset):
+    assert len(load_lg_hg2_dataframe(full_dataset, min_soc_range=0.02)) == \
+           len(load_lg_hg2_dataframe(full_dataset))

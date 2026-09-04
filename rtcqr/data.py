@@ -634,6 +634,7 @@ def load_lg_hg2_dataframe(
     max_gap_s: float = 300.0,
     column_overrides: Optional[Dict[str, Dict[str, str]]] = None,
     capacity_overrides: Optional[Dict[float, float]] = None,
+    min_soc_range: float = 0.0,
 ) -> List[BatteryFile]:
     """Load and reconstruct every measurement run under `root` into a list
     of BatteryFile windowing segments. See the module docstring for the
@@ -658,6 +659,13 @@ def load_lg_hg2_dataframe(
     `column_overrides` maps a filename (basename) to a per-field column-name
     override dict, for files where auto-detection needs help, e.g.:
         {"553_Mixed2.csv": {"current": "Current(A)"}}
+
+    `min_soc_range` drops segments whose SoC spans less than this. A drive
+    cycle that happens to fall in the saturated full-charge region carries a
+    near-constant label while V/I/T vary underneath: it teaches the model
+    nothing and, in the calibration split, contributes degenerate
+    nonconformity scores. Defaults to 0.0 (keep everything) so the loader
+    stays non-destructive; 0.02 is a reasonable value.
 
     `capacity_overrides` maps an ambient condition (degC) to a capacity in Ah,
     replacing whatever was measured for it. Use it when a condition's Cap_1C
@@ -743,6 +751,7 @@ def load_lg_hg2_dataframe(
     # Pass 2: compute SoC (per-group capacity denominator) and split into
     # windowing segments.
     out: List[BatteryFile] = []
+    dropped_degenerate: List[tuple] = []
     for group_key, combined in combined_by_group.items():
         condition = condition_by_group[group_key]
         section_list = section_list_by_group[group_key]
@@ -783,10 +792,20 @@ def load_lg_hg2_dataframe(
                 seg = _resample_uniform(seg, resample_dt_s)
             if len(seg) < 20:
                 continue
+            soc_range = float(seg["soc"].max() - seg["soc"].min())
+            if soc_range < min_soc_range:
+                dropped_degenerate.append((condition, group_key, soc_range))
+                continue
             out.append(BatteryFile(
                 path=f"measurement {group_key} ({section_list})", condition=condition, frame=seg,
                 start_time=seg_start, group_key=str(group_key),
             ))
+
+    if dropped_degenerate:
+        print(f"[rtcqr.data] dropped {len(dropped_degenerate)} segment(s) whose SoC spans less than "
+              f"{min_soc_range} (near-constant label): "
+              f"{[(c, k, round(r, 4)) for c, k, r in dropped_degenerate[:5]]}"
+              + (" ..." if len(dropped_degenerate) > 5 else ""))
 
     if not out:
         raise RuntimeError(
