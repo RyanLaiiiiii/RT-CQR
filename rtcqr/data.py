@@ -47,6 +47,16 @@ first in a run. This module instead:
      (The per-row Capacity[Ah] column looked promising for this but is
      unreliable: it resets to 0 at internal step boundaries, so only the
      raw Current signal is used.)
+     The coulomb count is normalized against that measurement's ambient
+     *condition*'s actual measured capacity (integrated from whichever
+     measurement group at that condition has a `Cap_1C` capacity-check
+     section -- see `_measured_capacity_ah`), not a single fixed
+     `rated_capacity_ah` across all temperatures. The LG HG2's usable
+     capacity drops substantially in the cold (per the datasheet's
+     capacity-vs-temperature curve), so a fixed nominal denominator makes
+     the reconstructed SoC floor rise well above 0 at every temperature
+     except the warmest, even though the test protocol depletes the same
+     ~95% of *actual* capacity at every condition.
   4. Resamples the continuous run onto a uniform time grid (default 1 Hz),
      since sections are logged at very different native rates (tens of
      seconds between samples during slow characterization/charge
@@ -109,6 +119,16 @@ _KEYWORDS = {
 # characterization runs, charge/rest/maintenance sections) is used only
 # for SoC continuity across a stitched run, then excluded from windowing.
 _DEFAULT_INCLUDE_PATTERNS = ["hwfet", "udds", "la92", "us06", "mixed"]
+
+# Test-section name identifying the 1C capacity-check discharge (a
+# standalone full discharge at 1C used to measure the cell's *actual*
+# capacity at that test's ambient temperature). See `_measured_capacity_ah`
+# and its use in `load_lg_hg2_dataframe` for why this matters: the cell's
+# usable capacity drops substantially at low temperature (per the LG HG2
+# datasheet's discharge-capacity-vs-temperature curve), so normalizing SoC
+# against a single fixed nominal capacity across all temperatures
+# understates depth of discharge at every temperature except the warmest.
+_CAPACITY_CHECK_PATTERN = "cap_1c"
 
 _KNOWN_DATETIME_FORMATS = ["%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %H:%M:%S"]
 
@@ -317,6 +337,31 @@ def _compute_soc_from_current(
     return soc
 
 
+def _measured_capacity_ah(
+    time_s: np.ndarray, current_a: np.ndarray, current_sign: float, max_gap_s: float = 300.0,
+) -> Optional[float]:
+    """Integrate the discharging current over a `Cap_1C` capacity-check
+    section to get that cell's actual measured capacity at that section's
+    ambient temperature, for use as the SoC coulomb-counting denominator in
+    place of the fixed nominal rating (see `_CAPACITY_CHECK_PATTERN`).
+
+    Only the discharging direction is summed (`-current_sign * current_a`,
+    clipped to >=0) so that any brief charge/rest padding included in the
+    section doesn't partially cancel out the discharge capacity. Returns
+    None if the section is too short or the result is implausibly small
+    (near-zero net discharge), signalling "not a real capacity check" rather
+    than a genuine near-zero capacity.
+    """
+    if len(time_s) < 5:
+        return None
+    dt = np.diff(time_s, prepend=time_s[0])
+    dt[0] = 0.0
+    dt = np.clip(dt, 0.0, max_gap_s)
+    discharge_a = np.clip(-current_sign * current_a, 0.0, None)
+    capacity_ah = float(np.sum(discharge_a * dt) / 3600.0)
+    return capacity_ah if capacity_ah > 0.1 else None
+
+
 def _parse_file_raw(path: str, overrides: Optional[Dict[str, str]]):
     """Parse one CSV into a raw per-file frame (abs_time, voltage, current,
     temperature, soc_raw) plus its group/section identity. Returns None if
@@ -422,6 +467,21 @@ def load_lg_hg2_dataframe(
     grouping/stitching/resampling procedure. Only test sections matching
     `include_patterns` are kept for windowing (pass None to keep all).
 
+    SoC coulomb-counting is normalized per ambient-temperature `condition`
+    against that condition's *actual* measured capacity (from whichever
+    measurement group at that condition includes a `Cap_1C` capacity-check
+    section), not the fixed `rated_capacity_ah`. The LG HG2's usable
+    capacity drops substantially at low temperature (per the datasheet's
+    capacity-vs-temperature curve), so normalizing every temperature against
+    one fixed nominal value understates depth of discharge everywhere except
+    the warmest condition -- confirmed on this dataset: the reconstructed
+    SoC floor scaled almost exactly with the datasheet's per-temperature 1C
+    capacity when using a fixed 3.0 Ah denominator (e.g. floor ~0.45-0.49 at
+    -20 degC vs ~0.12-0.15 at 25 degC), even though the test protocol
+    targets the same "95% of capacity discharged" stopping point at every
+    temperature. `rated_capacity_ah` is used as a fallback only for a
+    condition where no measurement group has its own `Cap_1C` section.
+
     `column_overrides` maps a filename (basename) to a per-field column-name
     override dict, for files where auto-detection needs help, e.g.:
         {"553_Mixed2.csv": {"current": "Current(A)"}}
@@ -438,7 +498,13 @@ def load_lg_hg2_dataframe(
         frame["test_section"] = test_section
         groups[group_key].append({"frame": frame, "condition": condition, "path": path})
 
-    out: List[BatteryFile] = []
+    # Pass 1: reconstruct each group's stitched frame and, where a group
+    # includes its own Cap_1C section, measure that condition's actual
+    # capacity from it.
+    combined_by_group: Dict[str, pd.DataFrame] = {}
+    condition_by_group: Dict[str, Optional[float]] = {}
+    section_list_by_group: Dict[str, str] = {}
+    capacity_readings: Dict[float, List[float]] = defaultdict(list)
     for group_key, parts in groups.items():
         combined = pd.concat([p["frame"] for p in parts], ignore_index=True)
         combined = combined.sort_values("abs_time").drop_duplicates(subset=["abs_time"], keep="first")
@@ -447,6 +513,7 @@ def load_lg_hg2_dataframe(
             continue
 
         combined["time"] = (combined["abs_time"] - combined["abs_time"].iloc[0]).dt.total_seconds()
+        condition = next((p["condition"] for p in parts if p["condition"] is not None), None)
 
         gaps = combined["time"].diff().to_numpy()
         big_gaps = gaps[gaps > max_gap_s]
@@ -457,6 +524,35 @@ def load_lg_hg2_dataframe(
                   f"test-section files; SoC will not account for current drawn during the gap(s), and each "
                   f"gap becomes a windowing segment boundary.")
 
+        if condition is not None:
+            cap_mask = combined["test_section"].apply(lambda s: _CAPACITY_CHECK_PATTERN in s.lower()).to_numpy()
+            if cap_mask.any():
+                measured = _measured_capacity_ah(
+                    combined.loc[cap_mask, "time"].to_numpy(),
+                    combined.loc[cap_mask, "current"].to_numpy(),
+                    current_sign, max_gap_s=max_gap_s,
+                )
+                if measured is not None:
+                    capacity_readings[condition].append(measured)
+
+        combined_by_group[group_key] = combined
+        condition_by_group[group_key] = condition
+        section_list_by_group[group_key] = section_list
+
+    capacity_by_condition = {cond: float(np.mean(vals)) for cond, vals in capacity_readings.items()}
+    for cond, vals in sorted(capacity_readings.items(), key=lambda kv: (kv[0] is None, kv[0])):
+        print(f"[rtcqr.data] condition={cond}: measured capacity {np.mean(vals):.3f} Ah "
+              f"(from {len(vals)} Cap_1C section(s): {[f'{v:.3f}' for v in vals]}), "
+              f"vs. rated_capacity_ah={rated_capacity_ah:.3f}")
+    warned_conditions: set = set()
+
+    # Pass 2: compute SoC (per-group capacity denominator) and split into
+    # windowing segments.
+    out: List[BatteryFile] = []
+    for group_key, combined in combined_by_group.items():
+        condition = condition_by_group[group_key]
+        section_list = section_list_by_group[group_key]
+
         if combined["soc_raw"].notna().mean() > 0.5:
             soc = combined["soc_raw"].to_numpy()
             if np.nanmax(soc) > 1.5:  # looks like a percentage
@@ -465,13 +561,17 @@ def load_lg_hg2_dataframe(
             if np.isnan(soc).any():
                 soc = pd.Series(soc).interpolate(limit_direction="both").to_numpy()
         else:
+            group_capacity_ah = capacity_by_condition.get(condition, rated_capacity_ah)
+            if condition not in capacity_by_condition and condition not in warned_conditions:
+                print(f"[rtcqr.data] condition={condition}: no Cap_1C section found at this condition in any "
+                      f"measurement group -- falling back to rated_capacity_ah={rated_capacity_ah:.3f} Ah for SoC "
+                      f"normalization at this condition.")
+                warned_conditions.add(condition)
             soc = _compute_soc_from_current(
                 combined["time"].to_numpy(), combined["current"].to_numpy(),
-                rated_capacity_ah, current_sign, soc_initial, max_gap_s=max_gap_s,
+                group_capacity_ah, current_sign, soc_initial, max_gap_s=max_gap_s,
             )
         combined["soc"] = soc
-
-        condition = next((p["condition"] for p in parts if p["condition"] is not None), None)
 
         if include_patterns:
             keep_mask = combined["test_section"].apply(lambda s: _matches_any(s, include_patterns)).to_numpy()
