@@ -14,8 +14,9 @@ script reuses the already-trained model + a deterministic re-derivation of
 the same split (same seed, same flags used for training) to check that
 without retraining, and prints the breakdown that confirms or rules it out.
 
-Usage: same data/split flags as train.py, plus --model-path.
-    python scripts/diagnose_calibration.py --data-root /path/to/lg_hg2
+Usage: same data/split flags as train.py, plus --model-path. Must be run
+from the repo root (same directory as train.py), since it imports from it.
+    python diagnose_calibration.py --data-root /path/to/lg_hg2
 """
 from __future__ import annotations
 
