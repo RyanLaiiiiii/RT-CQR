@@ -36,6 +36,15 @@ pip install -r requirements.txt
 
 ## Getting the data
 
+The dataset is the LG 18650HG2 Li-ion battery cycler data collected by
+Dr. Phillip Kollmeyer at McMaster University, Hamilton, Ontario, Canada
+(originally released on Mendeley Data as "LG 18650HG2 Li-ion Battery Data
+and Example Deep Neural Network xEV SOC Estimator Script"; the dataset's
+own README requests that any use of this data be appropriately
+referenced). This repo consumes it via the `aditya9790/lg-18650hg2-liion-battery-data`
+Kaggle mirror, downloaded at runtime via `kagglehub` -- the raw data is
+never committed to this repo.
+
 Configure Kaggle API credentials first (`~/.kaggle/kaggle.json` or the
 `KAGGLE_USERNAME`/`KAGGLE_KEY` env vars), then either let `train.py`
 download it for you:
