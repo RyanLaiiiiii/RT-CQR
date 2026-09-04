@@ -1,8 +1,7 @@
 """Data loading and windowing for the LG 18650HG2 Li-ion battery dataset.
 
 Real exports of this dataset are battery-cycler exports, not plain flat
-CSVs -- confirmed against 5 sample files (585_C20DisCh, 589_Charge1,
-589_Cap_1C, 589_HWFET, 589_Mixed1, 590_PausCycl):
+CSVs:
 
     Measurement ID,585
     Battery Name,LG HG2 18650_SN62A4
@@ -17,20 +16,21 @@ CSVs -- confirmed against 5 sample files (585_C20DisCh, 589_Charge1,
 
 i.e. ~20-30 metadata lines, then the real header row, then a units row,
 then the data. `_read_measurement_csv` locates and skips the
-preamble/units rows automatically.
+preamble/units rows automatically. Some files pad every metadata row
+(including the preamble) with trailing commas to match the widest row's
+column count (e.g. "Measurement ID,549,,,,,,,,,,,,"); `_extract_metadata`
+strips that padding so it doesn't corrupt the Measurement ID / Test
+section values used for grouping below.
 
 Critically, one CSV is *not* one independent test: filenames look like
-"<measurement_id>_<TestSection>.csv" (e.g. "589_Charge1.csv",
-"589_HWFET.csv", "589_Mixed1.csv"), and files sharing the same
+"<measurement_id>_<TestSection>.csv", and files sharing the same
 "Measurement ID" are chronologically contiguous slices of a single
-continuous cycler run -- confirmed from the sample files: 589_Charge1
-(11/29 18:53-20:59), 589_Cap_1C (11/29 20:59-21:59) and 589_HWFET (11/30
-08:39-10:02) share Measurement ID 589 and their per-row timestamps tile in
-that order, even though the file-level "Start Time"/"End Time" metadata is
-identical across all of them (it's the *measurement's* overall span, not
-the section's). Treating each file as its own independent test starting
-from a full charge -- the original, simpler assumption -- is therefore
-wrong for any file after the first section of a run. This module instead:
+continuous cycler run (confirmed via each row's own timestamp -- the
+file-level "Start Time"/"End Time" metadata is identical across every
+section of a measurement, since it's the measurement's overall span, not
+the individual section's). Treating each file as its own independent test
+starting from a full charge is therefore wrong for any section after the
+first in a run. This module instead:
 
   1. Groups files by Measurement ID (from metadata; falls back to
      treating each file as its own group if a copy of the dataset lacks
@@ -39,18 +39,20 @@ wrong for any file after the first section of a run. This module instead:
      timestamp, deduplicated.
   3. Computes SoC via coulomb counting *once*, continuously, across the
      whole reconstructed run, so SoC(0)=1.0 is only assumed at the start
-     of the run's earliest available section (confirmed on the sample:
-     589_Charge1 starts near 4.19 V, i.e. near-full).
+     of the run's earliest available section, with the running value
+     clipped to [0, 1] at *every* step (not once at the end -- see
+     `_compute_soc_from_current` for why this matters for measurements
+     that are repeated charge/discharge cycling runs rather than one
+     continuous depleting sweep).
      (The per-row Capacity[Ah] column looked promising for this but is
-     unreliable: it resets to 0 at internal step boundaries -- confirmed
-     on 589_Charge1, where it drops from 0.01126 back to 0.00000 partway
-     through the file -- so only the raw Current signal is used.)
+     unreliable: it resets to 0 at internal step boundaries, so only the
+     raw Current signal is used.)
   4. Resamples the continuous run onto a uniform time grid (default 1 Hz),
-     since sections are logged at very different native rates (~60 s
-     between samples during the slow Charge1/Cap_1C sections here, vs.
-     ~0.1 s during the dynamic HWFET/Mixed1 sections), which would
-     otherwise make a fixed window_size span wildly different real-time
-     durations depending on which section a window falls in.
+     since sections are logged at very different native rates (tens of
+     seconds between samples during slow characterization/charge
+     sections, vs. ~0.1s during dynamic drive-cycle sections), which
+     would otherwise make a fixed window_size span wildly different
+     real-time durations depending on which section a window falls in.
   5. Splits back into contiguous segments for windowing, breaking wherever
      a test section is excluded (see below) or wherever consecutive rows
      are more than `max_gap_s` apart in real time -- which happens if your
@@ -58,14 +60,20 @@ wrong for any file after the first section of a run. This module instead:
      cannot be tracked correctly across an unobserved gap in the current
      signal (a warning is printed when this is detected).
 
-Some test sections are static characterization runs (e.g. "C20DisCh" = C/20
-constant-current discharge for an OCV-SoC curve, "Cap_1C" = a 1C capacity
-check) rather than the dynamic drive-cycle profiles ("HWFET", "UDDS",
-"LA92", "US06", "Mixed*", ...) the paper evaluates on. Their current is
-still used for SoC continuity (step 3 above), but by default they are
-excluded from the windows used for training/evaluation; pass
-`exclude_patterns=None` to `load_lg_hg2_dataframe` (or `--include-all` to
-train.py) to keep them.
+Some test sections are static characterization or charge/rest/maintenance
+runs (e.g. "C20DisCh"/"Dis_0p5C"/"Dis_2C" = constant-current discharge
+characterization, "HPPC" = pulse power characterization, "Cap_1C" = a 1C
+capacity check, "Charge*", "PausCycl") rather than the dynamic drive-cycle
+profiles the paper evaluates on. Their current is still used for SoC
+continuity (step 3 above), but only sections matching `include_patterns`
+(default: the drive-cycle profile names HWFET/UDDS/LA92/US06/Mixed*) are
+kept for the windows used in training/evaluation; pass
+`include_patterns=None` to `load_lg_hg2_dataframe` (or `--include-all` to
+train.py) to keep everything. A blacklist of characterization-test
+keywords was tried first but proved fragile (real data includes section
+names like "Dis_0p5C" that a blacklist has to keep growing to catch);
+whitelisting the small, closed set of real drive-cycle names is more
+robust.
 
 Column names can still differ slightly across re-exports, so voltage /
 current / temperature / time / SoC columns are auto-detected by keyword
@@ -96,13 +104,11 @@ _KEYWORDS = {
     "soc": ["soc", "state of charge", "stateofcharge"],
 }
 
-# Test-section-name substrings (case-insensitive) identifying static
-# characterization runs rather than dynamic drive-cycle profiles. Their
-# current dynamics (slow constant-current or pulse tests) are very
-# different from the driving conditions the paper models, so by default
-# they are excluded from the windows used for training/evaluation (their
-# current is still used for SoC continuity across the run).
-_DEFAULT_EXCLUDE_PATTERNS = ["c20", "c/20", "cap", "ocv", "hppc", "pulse", "eis", "reset"]
+# Test-section-name substrings (case-insensitive) identifying the dynamic
+# drive-cycle profiles the paper evaluates on. Everything else (static
+# characterization runs, charge/rest/maintenance sections) is used only
+# for SoC continuity across a stitched run, then excluded from windowing.
+_DEFAULT_INCLUDE_PATTERNS = ["hwfet", "udds", "la92", "us06", "mixed"]
 
 _KNOWN_DATETIME_FORMATS = ["%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %H:%M:%S"]
 
@@ -170,7 +176,18 @@ def _find_header_row(path: str, max_scan: int = 100) -> Optional[int]:
 
 def _extract_metadata(path: str, max_scan: int = 40) -> Dict[str, str]:
     """Best-effort "Key,Value" metadata preamble scan (Measurement ID, Test
-    section, ...). Returns {} for a plain flat CSV with no such preamble."""
+    section, ...). Returns {} for a plain flat CSV with no such preamble.
+
+    Some files pad every row (including the metadata preamble) with
+    trailing commas to match the widest row's column count, e.g.
+    "Measurement ID,549,,,,,,,,,,,,". Taking `line.partition(",")`'s value
+    as-is would keep that padding ("549,,,,,,,,,,,,"), which -- since the
+    Measurement ID becomes the grouping key in `load_lg_hg2_dataframe` --
+    would silently split a measurement's own files into a second, bogus
+    group keyed by the padded string instead of merging them with the
+    rest of that measurement. The value is therefore also truncated at
+    its own next comma.
+    """
     meta: Dict[str, str] = {}
     with open(path, "r", errors="ignore") as f:
         for i, line in enumerate(f):
@@ -179,8 +196,9 @@ def _extract_metadata(path: str, max_scan: int = 40) -> Dict[str, str]:
             if "," in line:
                 k, _, v = line.partition(",")
                 k = k.strip()
+                v = v.partition(",")[0].strip()
                 if k and k not in meta:
-                    meta[k] = v.strip()
+                    meta[k] = v
     return meta
 
 
@@ -255,20 +273,48 @@ def _compute_soc_from_current(
     current[i] * dt[i] with dt[i] = time[i] - time[i-1] (a right-Riemann
     sum), which is a fine approximation across normal, closely-spaced
     samples but catastrophic across a *missing-data* gap: it would apply
-    the post-gap sample's current across the entire gap duration (e.g. a
-    single-sample current reading spuriously integrated over a 10-hour
-    hole left by an un-downloaded intermediate test-section file). dt is
-    therefore capped at `max_gap_s`, consistent with the gap threshold
-    used to split segments -- any gap beyond it contributes at most
-    `max_gap_s` worth of charge, rather than being blindly extrapolated
-    across time we have no current reading for.
+    the post-gap sample's current across the entire gap duration. dt is
+    therefore capped at `max_gap_s` -- any gap beyond it contributes at
+    most `max_gap_s` worth of charge, rather than being blindly
+    extrapolated across time we have no current reading for.
+
+    The running SoC is clipped to [0, 1] at *every* step, not once at the
+    end. A real cell physically cannot exceed 100% SoC -- charging current
+    that keeps flowing during CV tapering near full charge doesn't store
+    energy beyond capacity. This matters for measurements that are
+    repeated charge/discharge cycling runs (a "Charge_N" section fully
+    recharging the cell, then a "Mixed_N" section discharging it, repeated
+    many times) rather than one continuous depleting drive-cycle sweep:
+    confirmed on a real sample where 5 repeated Charge/Mixed cycles each
+    individually charge/discharge ~2.3-2.5 Ah (roughly 80% of the 3 Ah
+    rated capacity) against each other. A single end-of-array clip lets
+    the *unclipped* running sum drift arbitrarily far above 1.0 whenever
+    several charge segments land close together in the reconstructed
+    timeline before their matching discharge segments (order depends on
+    each row's real timestamp, not the paper's "Charge_N pairs with
+    Mixed_N" naming) -- e.g. repeated +0.8-SoC charges stacking up to +5.6
+    before any clipping is ever applied, so that even five subsequent
+    ~0.8-SoC discharges only bring the unclipped value down to +1.7,
+    which still displays as a flat 1.0 for the entire span once clipped.
+    Clipping at every step instead makes each charge segment correctly
+    saturate at 1.0 (as a real cell does) before the next discharge
+    segment starts, recovering the true sawtooth SoC pattern.
     """
     dt = np.diff(time_s, prepend=time_s[0])
     dt[0] = 0.0
     dt = np.clip(dt, 0.0, max_gap_s)
-    delta_ah = current_sign * current_a * dt / 3600.0
-    soc = soc_initial + np.cumsum(delta_ah) / rated_capacity_ah
-    return np.clip(soc, 0.0, 1.0)
+    delta_soc = current_sign * current_a * dt / 3600.0 / rated_capacity_ah
+
+    soc = np.empty_like(delta_soc)
+    running = float(soc_initial)
+    for k in range(delta_soc.shape[0]):
+        running += float(delta_soc[k])
+        if running > 1.0:
+            running = 1.0
+        elif running < 0.0:
+            running = 0.0
+        soc[k] = running
+    return soc
 
 
 def _parse_file_raw(path: str, overrides: Optional[Dict[str, str]]):
@@ -366,14 +412,15 @@ def load_lg_hg2_dataframe(
     rated_capacity_ah: float = 3.0,
     current_sign: float = 1.0,
     soc_initial: float = 1.0,
-    exclude_patterns: Optional[Sequence[str]] = _DEFAULT_EXCLUDE_PATTERNS,
+    include_patterns: Optional[Sequence[str]] = _DEFAULT_INCLUDE_PATTERNS,
     resample_dt_s: Optional[float] = 1.0,
     max_gap_s: float = 300.0,
     column_overrides: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> List[BatteryFile]:
     """Load and reconstruct every measurement run under `root` into a list
     of BatteryFile windowing segments. See the module docstring for the
-    grouping/stitching/resampling procedure.
+    grouping/stitching/resampling procedure. Only test sections matching
+    `include_patterns` are kept for windowing (pass None to keep all).
 
     `column_overrides` maps a filename (basename) to a per-field column-name
     override dict, for files where auto-detection needs help, e.g.:
@@ -426,8 +473,8 @@ def load_lg_hg2_dataframe(
 
         condition = next((p["condition"] for p in parts if p["condition"] is not None), None)
 
-        if exclude_patterns:
-            keep_mask = ~combined["test_section"].apply(lambda s: _matches_any(s, exclude_patterns)).to_numpy()
+        if include_patterns:
+            keep_mask = combined["test_section"].apply(lambda s: _matches_any(s, include_patterns)).to_numpy()
         else:
             keep_mask = np.ones(len(combined), dtype=bool)
         if not keep_mask.any():
@@ -515,8 +562,8 @@ class Standardizer:
 
 
 def _inspect(root: str, include_all: bool) -> None:
-    exclude = None if include_all else _DEFAULT_EXCLUDE_PATTERNS
-    files = load_lg_hg2_dataframe(root, exclude_patterns=exclude)
+    include_patterns = None if include_all else _DEFAULT_INCLUDE_PATTERNS
+    files = load_lg_hg2_dataframe(root, include_patterns=include_patterns)
     print(f"\n{len(files)} windowing segment(s) after grouping/stitching/splitting:\n")
     for bf in files:
         df = bf.frame

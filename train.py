@@ -23,7 +23,7 @@ import os
 import random
 import time
 from dataclasses import asdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -33,7 +33,7 @@ from rtcqr.baselines import make_cqr_calibrator, make_rtcqr_calibrator, make_wcp
 from rtcqr.config import RTCQRConfig
 from rtcqr.data import (
     Standardizer,
-    _DEFAULT_EXCLUDE_PATTERNS,
+    _DEFAULT_INCLUDE_PATTERNS,
     chronological_split,
     load_lg_hg2_dataframe,
     make_windows,
@@ -50,12 +50,20 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include_all: bool = False):
-    exclude_patterns = None if include_all else _DEFAULT_EXCLUDE_PATTERNS
+def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include_all: bool = False,
+                   exclude_measurement_ids: Optional[List[str]] = None):
+    include_patterns = None if include_all else _DEFAULT_INCLUDE_PATTERNS
     files = load_lg_hg2_dataframe(
         data_root, rated_capacity_ah=cfg.rated_capacity_ah, current_sign=current_sign,
-        exclude_patterns=exclude_patterns, resample_dt_s=cfg.resample_dt_s,
+        include_patterns=include_patterns, resample_dt_s=cfg.resample_dt_s,
     )
+
+    if exclude_measurement_ids:
+        before = len(files)
+        excluded = {str(x) for x in exclude_measurement_ids}
+        files = [bf for bf in files if not any(f"measurement {mid} " in bf.path for mid in excluded)]
+        print(f"[rtcqr.train] Excluded {before - len(files)} segment(s) from measurement IDs {sorted(excluded)}")
+
     print(f"[rtcqr.train] Loaded {len(files)} windowing segment(s) from {data_root}")
 
     train_frames, val_frames, test_frames = chronological_split(files, cfg.train_frac, cfg.val_frac)
@@ -211,6 +219,9 @@ def main():
     parser.add_argument("--include-all", action="store_true",
                          help="Include static characterization test sections (C/20, OCV, HPPC, ...) instead of "
                               "only dynamic drive-cycle profiles.")
+    parser.add_argument("--exclude-measurement-ids", nargs="+", default=None,
+                         help="Drop entire Measurement IDs from the windowing segments, "
+                              "e.g. --exclude-measurement-ids 590 556")
     parser.add_argument("--calibrators", nargs="+", default=["rtcqr", "cqr", "wcp"], choices=["rtcqr", "cqr", "wcp"])
     parser.add_argument("--no-ltr", action="store_true", help="Ablation: disable the lower-tail regularizer (lambda_l=0).")
     parser.add_argument("--max-epochs", type=int, default=None)
@@ -247,7 +258,8 @@ def main():
             raise SystemExit("Provide --data-root <path> or pass --download to fetch it via kagglehub.")
         data_root = args.data_root
 
-    splits = build_windows(cfg, data_root, current_sign=args.current_sign, include_all=args.include_all)
+    splits = build_windows(cfg, data_root, current_sign=args.current_sign, include_all=args.include_all,
+                            exclude_measurement_ids=args.exclude_measurement_ids)
 
     t0 = time.time()
     model = train_model(cfg, splits, device)

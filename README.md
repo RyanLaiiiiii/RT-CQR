@@ -87,6 +87,24 @@ it turned out to reset to 0 at internal step boundaries -- confirmed on
 `589_Charge1`, where it drops from 0.01126 back to 0.00000 partway
 through the same file -- so only `Current` is used.)
 
+The running SoC is clipped to `[0, 1]` at *every* step of the coulomb
+count, not once at the end. This matters for measurements that are
+**repeated charge/discharge cycling runs** rather than one continuous
+depleting sweep -- confirmed on real data where a `Charge_N` section
+recharges the cell (~+2.3-2.5 Ah, ~80% of the 3 Ah rated capacity) and the
+following `Mixed_N` section discharges it by a similar amount, repeated
+many times. A single end-of-array clip lets the *unclipped* running sum
+drift arbitrarily far above 1.0 whenever several charge segments land
+close together in the true chronological order before their matching
+discharge segments (order follows each row's real timestamp, not the
+`Charge_N`-pairs-with-`Mixed_N` naming) -- e.g. several +80%-SoC charges
+stacking up before any clipping is applied, so that even several
+subsequent ~80%-SoC discharges only bring the unclipped value back down
+to some other value still above 1.0, which displays as a flat 1.0 for the
+entire span once clipped, masking real depletion. Clipping at every step
+instead makes each charge segment correctly saturate at 1.0 (as a real
+cell does) before the next discharge segment starts.
+
 If your copy of the dataset is missing an intermediate section for some
 measurement, there will be a real time gap in the stitched run where SoC
 can't be tracked (no current reading for that period); `load_lg_hg2_dataframe`
@@ -96,15 +114,25 @@ extrapolating one sample's current across the whole gap) and splits the
 run into separate windowing segments there, so a training window never
 silently spans the hole.
 
-Some test sections are static characterization tests (e.g. `C20DisCh` =
-C/20 constant-current discharge for an OCV-SoC curve, `Cap_1C` = a 1C
-capacity check) rather than the dynamic drive-cycle profiles (`HWFET`,
-`UDDS`, `LA92`, `US06`, `Mixed*`, ...) the paper evaluates on. Their
-current is still used for SoC continuity, but by default they're excluded
-from the windows used for training/evaluation -- `load_lg_hg2_dataframe`
-excludes test sections matching `c20`, `cap`, `ocv`, `hppc`, `pulse`,
-`eis`, `reset` (case-insensitive); pass `--include-all` to `train.py` (or
-`exclude_patterns=None` to `load_lg_hg2_dataframe`) to keep everything.
+Some test sections are static characterization or charge/rest/maintenance
+runs (e.g. `C20DisCh`/`Dis_0p5C`/`Dis_2C` = constant-current discharge
+characterization, `HPPC` = pulse power characterization, `Cap_1C` = a 1C
+capacity check, `Charge*`, `PausCycl`) rather than the dynamic drive-cycle
+profiles (`HWFET`, `UDDS`, `LA92`, `US06`, `Mixed*`, ...) the paper
+evaluates on. Their current is still used for SoC continuity, but only
+sections matching `include_patterns` are kept for the windows used in
+training/evaluation -- `load_lg_hg2_dataframe` defaults to a *whitelist*
+of the 5 real drive-cycle name patterns above (case-insensitive); pass
+`--include-all` to `train.py` (or `include_patterns=None` to
+`load_lg_hg2_dataframe`) to keep everything. A blacklist of
+characterization-test keywords was tried first but proved fragile (real
+data includes section names like `Dis_0p5C` that a blacklist has to keep
+growing to catch); whitelisting the small, closed set of real drive-cycle
+names is more robust.
+
+If a specific Measurement ID still looks wrong after inspecting it (see
+below), `train.py --exclude-measurement-ids 590 556 ...` drops it
+entirely rather than fixing the loader for that one case.
 
 Because sections are logged at very different native rates (~60s between
 samples during the slow `Charge1`/`Cap_1C` sections, vs. ~0.1s during the
@@ -178,6 +206,8 @@ python train.py --data-root /path/to/lg_hg2 --calibrators cqr --output-dir outpu
 - `--current-sign {1,-1}` — coulomb-counting sign convention (see above).
 - `--include-all` — keep static characterization test sections instead of
   only dynamic drive-cycle profiles.
+- `--exclude-measurement-ids ID [ID ...]` — drop specific Measurement IDs
+  entirely from the windowing segments.
 - `--calibrators rtcqr cqr wcp` — which calibration methods to report.
 - `--max-epochs`, `--patience`, `--seed` — training controls.
 
