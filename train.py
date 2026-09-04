@@ -106,14 +106,21 @@ def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include
     }
 
 
-def train_model(cfg: RTCQRConfig, splits, device: torch.device) -> TCNQuantileNet:
+def train_model(cfg: RTCQRConfig, splits, device: torch.device, num_workers: int = 2) -> TCNQuantileNet:
     X_train, y_train = splits["train"]
     X_val, y_val = splits["val"]
 
     train_ds = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
     val_ds = TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val))
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
+    # pin_memory + non_blocking .to() below overlap the host->device copy with
+    # compute; num_workers>0 moves batch assembly off the main process so it
+    # doesn't serialize with GPU dispatch. Both only help when there's a GPU
+    # to keep fed -- on CPU they're neutral to slightly wasteful, hence the
+    # pin_memory/device gating below.
+    pin_memory = device.type == "cuda"
+    loader_kwargs = dict(num_workers=num_workers, pin_memory=pin_memory, persistent_workers=num_workers > 0)
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
 
     model = TCNQuantileNet(
         in_channels=cfg.in_channels,
@@ -126,6 +133,11 @@ def train_model(cfg: RTCQRConfig, splits, device: torch.device) -> TCNQuantileNe
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
 
+    # Mixed precision only applies (and only helps) on CUDA; autocast/GradScaler
+    # are harmless no-ops with enabled=False, so this is safe on CPU too.
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
+
     best_val = float("inf")
     best_state = None
     epochs_no_improve = 0
@@ -134,14 +146,17 @@ def train_model(cfg: RTCQRConfig, splits, device: torch.device) -> TCNQuantileNe
         model.train()
         train_loss = 0.0
         for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            optimizer.zero_grad()
-            q_pred = model(xb)
-            loss = composite_quantile_loss(
-                yb, q_pred, cfg.quantile_levels, cfg.soc_min, cfg.lambda_nc, cfg.lambda_l, cfg.tau_l_index
-            )
-            loss.backward()
-            optimizer.step()
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                q_pred = model(xb)
+                loss = composite_quantile_loss(
+                    yb, q_pred, cfg.quantile_levels, cfg.soc_min, cfg.lambda_nc, cfg.lambda_l, cfg.tau_l_index
+                )
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             train_loss += loss.item() * xb.size(0)
         train_loss /= len(train_ds)
 
@@ -149,11 +164,13 @@ def train_model(cfg: RTCQRConfig, splits, device: torch.device) -> TCNQuantileNe
         val_loss = 0.0
         with torch.no_grad():
             for xb, yb in val_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                q_pred = model(xb)
-                loss = composite_quantile_loss(
-                    yb, q_pred, cfg.quantile_levels, cfg.soc_min, cfg.lambda_nc, cfg.lambda_l, cfg.tau_l_index
-                )
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                    q_pred = model(xb)
+                    loss = composite_quantile_loss(
+                        yb, q_pred, cfg.quantile_levels, cfg.soc_min, cfg.lambda_nc, cfg.lambda_l, cfg.tau_l_index
+                    )
                 val_loss += loss.item() * xb.size(0)
         val_loss /= len(val_ds)
         scheduler.step(val_loss)
@@ -253,6 +270,10 @@ def main():
                               "measurement run before windowing (default 1.0). Pass 0 to disable resampling.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default="outputs")
+    parser.add_argument("--num-workers", type=int, default=2,
+                         help="DataLoader worker processes for batch assembly (default 2). Only matters with a "
+                              "GPU -- keeps the GPU fed instead of waiting on the main process to build each "
+                              "batch. Set to 0 to disable (e.g. if multiprocessing misbehaves in your environment).")
     args = parser.parse_args()
 
     cfg = RTCQRConfig(seed=args.seed)
@@ -283,7 +304,7 @@ def main():
                             exclude_measurement_ids=args.exclude_measurement_ids, split_mode=args.split_mode)
 
     t0 = time.time()
-    model = train_model(cfg, splits, device)
+    model = train_model(cfg, splits, device, num_workers=args.num_workers)
     print(f"[rtcqr.train] training finished in {time.time() - t0:.1f}s")
 
     results = evaluate(cfg, model, splits, device, calibrators=args.calibrators)
