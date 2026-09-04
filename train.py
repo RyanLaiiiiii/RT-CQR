@@ -54,9 +54,9 @@ def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include
     exclude_patterns = None if include_all else _DEFAULT_EXCLUDE_PATTERNS
     files = load_lg_hg2_dataframe(
         data_root, rated_capacity_ah=cfg.rated_capacity_ah, current_sign=current_sign,
-        exclude_patterns=exclude_patterns,
+        exclude_patterns=exclude_patterns, resample_dt_s=cfg.resample_dt_s,
     )
-    print(f"[rtcqr.train] Loaded {len(files)} drive-cycle files from {data_root}")
+    print(f"[rtcqr.train] Loaded {len(files)} windowing segment(s) from {data_root}")
 
     train_frames, val_frames, test_frames = chronological_split(files, cfg.train_frac, cfg.val_frac)
 
@@ -216,6 +216,9 @@ def main():
     parser.add_argument("--max-epochs", type=int, default=None)
     parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--window-size", type=int, default=None)
+    parser.add_argument("--resample-dt", type=float, default=None,
+                         help="Uniform resampling interval in seconds applied to each reconstructed "
+                              "measurement run before windowing (default 1.0). Pass 0 to disable resampling.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default="outputs")
     args = parser.parse_args()
@@ -229,6 +232,8 @@ def main():
         cfg.patience = args.patience
     if args.window_size is not None:
         cfg.window_size = args.window_size
+    if args.resample_dt is not None:
+        cfg.resample_dt_s = args.resample_dt or None
 
     set_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

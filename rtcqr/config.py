@@ -7,7 +7,7 @@ kernel-size-3 TCN with dropout 0.1, Adam (lr=1e-3, batch size 64), and
 lambda_nc=1.0, lambda_l=0.1, zeta=0.98, gamma=1.0.
 """
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 
 @dataclass
@@ -15,6 +15,7 @@ class RTCQRConfig:
     # --- Data / windowing ---
     window_size: int = 100
     stride: int = 1
+    resample_dt_s: Optional[float] = 1.0  # uniform resampling interval (s) applied before windowing
     rated_capacity_ah: float = 3.0
     soc_min: float = 0.10
     # tau in eq. (14)/(17): T = {0.025, 0.05, 0.10, 0.15, 0.85, 0.90, 0.95, 0.975}
