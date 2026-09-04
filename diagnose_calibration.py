@@ -25,7 +25,9 @@ import argparse
 import numpy as np
 import torch
 
+from rtcqr.baselines import make_cqr_calibrator, make_rtcqr_calibrator, make_wcp_calibrator
 from rtcqr.config import RTCQRConfig
+from rtcqr.metrics import summarize
 from rtcqr.model import TCNQuantileNet
 from train import build_windows, predict_quantiles, set_seed
 
@@ -108,6 +110,44 @@ def main():
             print(f"    {describe('upper_excess (soc_true - q_hi, if soc under-covered from above)', upper_excess)}")
             print(f"    frac of samples where lower_excess > upper_excess (i.e. wl-branch would win the max): "
                   f"{lower_wins:.4f}")
+
+    # Clip-pileup check: the capacity fix normalizes SoC against each
+    # condition's *measured* capacity, and several segments' true depletion
+    # runs past that point (dynamic drive-cycle loads can extract slightly
+    # more capacity than the pure-1C Cap_1C reference), hitting the [0,1]
+    # clip in `_compute_soc_from_current` and "freezing" SoC at exactly 0
+    # (or 1) for a stretch even though V/I/T keep changing underneath. That
+    # pileup of samples with an unrealistic (label-frozen) SoC target sits
+    # right at the most extreme quantiles (tau=0.025/0.975, used by the 95%
+    # PI), which is a plausible explanation if 95% PI calibration looks
+    # worse than 90% PI. This recomputes LVR/AIW/ACE for each calibrator
+    # with vs. without the clipped-boundary samples in the *test* set (they
+    # stay in calib either way, matching train.py) to check that.
+    clip_eps = 1e-3
+    calib_clip_frac = float(np.mean((y_calib <= clip_eps) | (y_calib >= 1 - clip_eps)))
+    test_clip_frac = float(np.mean((y_test <= clip_eps) | (y_test >= 1 - clip_eps)))
+    print(f"\n--- clip-pileup check (SoC within {clip_eps} of 0 or 1) ---")
+    print(f"calib: frac clipped = {calib_clip_frac:.4f}   test: frac clipped = {test_clip_frac:.4f}")
+
+    test_keep = (y_test > clip_eps) & (y_test < 1 - clip_eps)
+    calibrator_makers = {
+        "rtcqr": lambda: make_rtcqr_calibrator(cfg.soc_min, cfg.zeta, cfg.gamma, cfg.wl0, cfg.wl1, cfg.wu),
+        "cqr": lambda: make_cqr_calibrator(cfg.soc_min),
+        "wcp": lambda: make_wcp_calibrator(cfg.soc_min, zeta=cfg.zeta),
+    }
+    for alpha in cfg.pi_alphas:
+        idx_l, idx_u = cfg.quantile_bounds(alpha)
+        pi_key = f"{int(round((1 - alpha) * 100))}%"
+        print(f"\n  [{pi_key} PI] method       LVR(all)  AIW(all)  ACE(all)  |  LVR(no-clip)  AIW(no-clip)  ACE(no-clip)")
+        for name, make in calibrator_makers.items():
+            calibrator = make()
+            calibrator.fit(y_calib, q_calib[:, idx_l], q_calib[:, idx_u])
+            lo_all, hi_all = calibrator.calibrate_interval(q_test[:, idx_l], q_test[:, idx_u], alpha)
+            m_all = summarize(y_test, lo_all, hi_all, alpha, cfg.soc_min)
+            lo_kn, hi_kn = lo_all[test_keep], hi_all[test_keep]
+            m_kn = summarize(y_test[test_keep], lo_kn, hi_kn, alpha, cfg.soc_min)
+            print(f"    {name:<10} {m_all['LVR']:.3f}     {m_all['AIW']:.3f}     {m_all['ACE']:.3f}     |  "
+                  f"{m_kn['LVR']:.3f}          {m_kn['AIW']:.3f}          {m_kn['ACE']:.3f}")
 
 
 if __name__ == "__main__":
