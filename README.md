@@ -186,6 +186,25 @@ coverage on a held-out calibration split, and reports LVR / AIW / ACE
 quantile model. Results and the trained weights are written to
 `outputs/results.json` and `outputs/rtcqr_model.pt`.
 
+### Train/val/calib/test split
+
+By default (`--split-mode segment`), whole windowing segments are
+randomly assigned to train/val/calib/test. This matters because most
+segments in this dataset are short (a few hours), single charge/discharge
+cycles whose SoC declines from ~1.0 to some low point over their own
+duration. Slicing each segment chronologically (`--split-mode
+chronological`, the original approach) would systematically give train
+the high-SoC early portion and test the low-SoC late portion of every
+cycle -- confirmed on the full dataset: calib mean SoC 0.33 vs. test mean
+SoC 0.25, and a 24% quantile-crossing rate on test vs. 3% on calib. That
+breaks both generalization (train rarely sees low-SoC examples) and the
+conformal calibration exchangeability assumption (calib and test come
+from systematically different SoC populations), producing badly
+miscalibrated intervals (ACE far above 0, and a 95% PI narrower than the
+90% PI). `chronological` is kept for datasets made of a small number of
+long, continuous multi-profile sweeps, where 15% of one such sweep still
+spans a representative chunk of the SoC trajectory.
+
 ### Reproducing the ablation study (Table IV)
 
 ```bash
@@ -204,6 +223,8 @@ python train.py --data-root /path/to/lg_hg2 --calibrators cqr --output-dir outpu
 - `--resample-dt S` — uniform resampling interval in seconds before
   windowing (default 1.0); pass 0 to window over native sampling instead.
 - `--current-sign {1,-1}` — coulomb-counting sign convention (see above).
+- `--split-mode {segment,chronological}` — how train/val/calib/test are
+  carved out (see above); default `segment`.
 - `--include-all` — keep static characterization test sections instead of
   only dynamic drive-cycle profiles.
 - `--exclude-measurement-ids ID [ID ...]` — drop specific Measurement IDs

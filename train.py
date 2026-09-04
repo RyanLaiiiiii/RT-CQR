@@ -37,6 +37,7 @@ from rtcqr.data import (
     chronological_split,
     load_lg_hg2_dataframe,
     make_windows,
+    segment_split,
 )
 from rtcqr.losses import composite_quantile_loss
 from rtcqr.metrics import summarize
@@ -51,7 +52,7 @@ def set_seed(seed: int):
 
 
 def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include_all: bool = False,
-                   exclude_measurement_ids: Optional[List[str]] = None):
+                   exclude_measurement_ids: Optional[List[str]] = None, split_mode: str = "segment"):
     include_patterns = None if include_all else _DEFAULT_INCLUDE_PATTERNS
     files = load_lg_hg2_dataframe(
         data_root, rated_capacity_ah=cfg.rated_capacity_ah, current_sign=current_sign,
@@ -66,15 +67,27 @@ def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include
 
     print(f"[rtcqr.train] Loaded {len(files)} windowing segment(s) from {data_root}")
 
-    train_frames, val_frames, test_frames = chronological_split(files, cfg.train_frac, cfg.val_frac)
-
-    # further split each validation frame chronologically into model-val / calibration
-    val_model_frames, calib_frames = [], []
-    for df in val_frames:
-        n_val = len(df)
-        n_cal = int(round(n_val * cfg.val_calib_fraction))
-        val_model_frames.append(df.iloc[:n_val - n_cal].reset_index(drop=True))
-        calib_frames.append(df.iloc[n_val - n_cal:].reset_index(drop=True))
+    if split_mode == "segment":
+        # Most segments in this dataset are short, single charge/discharge
+        # cycles (SoC ~1.0 -> some low point over a few hours). Slicing each
+        # one chronologically would systematically give train the high-SoC
+        # early portion and test the low-SoC late portion of every cycle --
+        # confirmed on the full dataset: calib mean SoC 0.33 vs. test mean
+        # SoC 0.25, and a 24% quantile-crossing rate on test vs. 3% on
+        # calib. Assigning whole segments to a split instead keeps each
+        # split's SoC distribution representative.
+        train_frames, val_model_frames, calib_frames, test_frames = segment_split(
+            files, cfg.train_frac, cfg.val_frac, cfg.val_calib_fraction, seed=cfg.seed
+        )
+    else:
+        train_frames, val_frames, test_frames = chronological_split(files, cfg.train_frac, cfg.val_frac)
+        # further split each validation frame chronologically into model-val / calibration
+        val_model_frames, calib_frames = [], []
+        for df in val_frames:
+            n_val = len(df)
+            n_cal = int(round(n_val * cfg.val_calib_fraction))
+            val_model_frames.append(df.iloc[:n_val - n_cal].reset_index(drop=True))
+            calib_frames.append(df.iloc[n_val - n_cal:].reset_index(drop=True))
 
     X_train, y_train = make_windows(train_frames, cfg.window_size, cfg.stride)
     X_val, y_val = make_windows(val_model_frames, cfg.window_size, cfg.stride)
@@ -222,6 +235,11 @@ def main():
     parser.add_argument("--exclude-measurement-ids", nargs="+", default=None,
                          help="Drop entire Measurement IDs from the windowing segments, "
                               "e.g. --exclude-measurement-ids 590 556")
+    parser.add_argument("--split-mode", choices=["segment", "chronological"], default="segment",
+                         help="'segment' (default) randomly assigns whole segments to train/val/calib/test, "
+                              "appropriate when most segments are short single charge/discharge cycles. "
+                              "'chronological' slices each segment by time, appropriate only when segments are "
+                              "few, long, continuous multi-profile sweeps.")
     parser.add_argument("--calibrators", nargs="+", default=["rtcqr", "cqr", "wcp"], choices=["rtcqr", "cqr", "wcp"])
     parser.add_argument("--no-ltr", action="store_true", help="Ablation: disable the lower-tail regularizer (lambda_l=0).")
     parser.add_argument("--max-epochs", type=int, default=None)
@@ -259,7 +277,7 @@ def main():
         data_root = args.data_root
 
     splits = build_windows(cfg, data_root, current_sign=args.current_sign, include_all=args.include_all,
-                            exclude_measurement_ids=args.exclude_measurement_ids)
+                            exclude_measurement_ids=args.exclude_measurement_ids, split_mode=args.split_mode)
 
     t0 = time.time()
     model = train_model(cfg, splits, device)

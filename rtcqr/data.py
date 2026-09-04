@@ -501,11 +501,17 @@ def chronological_split(
 ) -> Tuple[List[pd.DataFrame], List[pd.DataFrame], List[pd.DataFrame]]:
     """Split each segment's time series into train/val/test slices in time order.
 
-    Splitting within each segment (rather than assigning whole segments to
-    a split) keeps every drive cycle and every temperature condition
-    represented in all three splits while still respecting chronological
-    order, matching the paper's use of a fixed train/val/test partition
-    with the test portion held out purely for final evaluation.
+    Appropriate for a dataset made of a small number of long, continuous
+    multi-profile sweeps (SoC declining smoothly from ~1.0 to some low
+    point over many hours), where 15% of one such sweep still spans a
+    meaningful, representative chunk of the SoC trajectory. Wrong for a
+    dataset made of many short, single charge/discharge-cycle segments
+    (see `segment_split`): slicing chronologically within a short segment
+    systematically gives train the high-SoC early portion and test the
+    low-SoC late portion of every cycle, so train rarely sees low-SoC
+    examples and the calibration set's SoC distribution differs
+    systematically from the test set's -- breaking both generalization
+    and the conformal calibration exchangeability assumption.
     """
     train_parts, val_parts, test_parts = [], [], []
     for bf in files:
@@ -517,6 +523,44 @@ def chronological_split(
         val_parts.append(df.iloc[n_train:n_train + n_val].reset_index(drop=True))
         test_parts.append(df.iloc[n_train + n_val:].reset_index(drop=True))
     return train_parts, val_parts, test_parts
+
+
+def segment_split(
+    files: Sequence[BatteryFile],
+    train_frac: float,
+    val_frac: float,
+    val_calib_fraction: float,
+    seed: int = 42,
+) -> Tuple[List[pd.DataFrame], List[pd.DataFrame], List[pd.DataFrame], List[pd.DataFrame]]:
+    """Randomly assign *whole* segments to train / val_model / calib / test,
+    instead of slicing each segment chronologically (see `chronological_split`
+    for why that's wrong for this dataset). Every split then sees a
+    representative mix of full charge/discharge trajectories rather than a
+    systematically biased SoC sub-range. Returns (train, val_model, calib,
+    test) frame lists directly, since calib is carved out of the same
+    segment-level split as val rather than by further slicing val segments
+    chronologically (which would reintroduce the same bias at a smaller
+    scale).
+    """
+    rng = np.random.default_rng(seed)
+    n = len(files)
+    order = rng.permutation(n)
+
+    n_train = max(1, int(round(n * train_frac)))
+    n_val_total = max(1, int(round(n * val_frac)))
+    n_val = max(1, int(round(n_val_total * (1.0 - val_calib_fraction))))
+    n_calib = max(1, n_val_total - n_val)
+    n_train = min(n_train, max(1, n - n_val - n_calib - 1))  # leave >=1 segment for test
+
+    train_idx = order[:n_train]
+    val_idx = order[n_train:n_train + n_val]
+    calib_idx = order[n_train + n_val:n_train + n_val + n_calib]
+    test_idx = order[n_train + n_val + n_calib:]
+
+    def frames(idx: np.ndarray) -> List[pd.DataFrame]:
+        return [files[i].frame for i in idx]
+
+    return frames(train_idx), frames(val_idx), frames(calib_idx), frames(test_idx)
 
 
 def make_windows(
