@@ -99,7 +99,7 @@ import glob
 import os
 import re
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -129,6 +129,27 @@ _DEFAULT_INCLUDE_PATTERNS = ["hwfet", "udds", "la92", "us06", "mixed"]
 # against a single fixed nominal capacity across all temperatures
 # understates depth of discharge at every temperature except the warmest.
 _CAPACITY_CHECK_PATTERN = "cap_1c"
+
+# Plausibility guards for a measured capacity (see `_measured_capacity_ah`).
+# A capacity check that fails all of these is discarded in favour of the
+# nominal rating, because an under-measured denominator is far more damaging
+# than a slightly-wrong one: it drives reconstructed SoC into the [0, 1]
+# clip, freezing whole drive-cycle segments at exactly 0.0 and destroying the
+# coulomb count for everything after them in the same run.
+_MIN_CAPACITY_AH = 0.1
+_MIN_CAPACITY_SECTION_ROWS = 5
+# A 1C discharge empties the cell in ~1 h *by definition of 1C*, so the
+# section's duration is a capacity-independent truncation detector: it is the
+# check that catches a section the export cut short, whose integrated Ah is
+# otherwise perfectly plausible-looking. The window is wide because the
+# cycler sets the current from the *nominal* rating, so a cold cell holding
+# less charge finishes sooner (1.64 Ah at 3.0 A = 0.55 h at -20 degC).
+_DURATION_PLAUSIBLE_H = (0.4, 2.5)
+# True C-rate = mean discharge current / rated capacity. Only checkable when
+# the nominal rating is known; catches a section discharged at a rate that
+# isn't a capacity check at all (a drive cycle mislabelled, say).
+_C_RATE_PLAUSIBLE_RANGE = (0.4, 2.0)
+_CAPACITY_PLAUSIBLE_RANGE = (0.3, 1.1)  # multiples of rated_capacity_ah
 
 _KNOWN_DATETIME_FORMATS = ["%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %H:%M:%S"]
 
@@ -170,12 +191,21 @@ def detect_columns(df: pd.DataFrame, overrides: Optional[Dict[str, str]] = None)
     return mapping
 
 
+# Sub-zero ambient folders are named with an "n" prefix in the McMaster
+# release ("n10degC"), but re-exports and mirrors use "-10degC" / "neg10degC"
+# / "minus10degC". All four must map to -10.0: `condition` is the key the
+# per-condition capacity denominator is looked up under, so silently reading
+# "-10degC" as +10.0 would merge the -10 degC and +10 degC conditions and
+# apply one averaged capacity to both.
+_NEGATIVE_TEMP_PREFIX = re.compile(r"(?:^|[^a-z0-9])(n|neg|minus|-)\s*$", re.IGNORECASE)
+
+
 def _extract_temperature_c(folder_name: str) -> Optional[float]:
-    m = re.search(r"(n)?(\d+)\s*deg", folder_name, flags=re.IGNORECASE)
+    m = re.search(r"(\d+)\s*deg", folder_name, flags=re.IGNORECASE)
     if not m:
         return None
-    sign = -1.0 if m.group(1) else 1.0
-    return sign * float(m.group(2))
+    sign = -1.0 if _NEGATIVE_TEMP_PREFIX.search(folder_name[:m.start(1)]) else 1.0
+    return sign * float(m.group(1))
 
 
 def _find_header_row(path: str, max_scan: int = 100) -> Optional[int]:
@@ -337,29 +367,138 @@ def _compute_soc_from_current(
     return soc
 
 
-def _measured_capacity_ah(
-    time_s: np.ndarray, current_a: np.ndarray, current_sign: float, max_gap_s: float = 300.0,
-) -> Optional[float]:
-    """Integrate the discharging current over a `Cap_1C` capacity-check
-    section to get that cell's actual measured capacity at that section's
-    ambient temperature, for use as the SoC coulomb-counting denominator in
-    place of the fixed nominal rating (see `_CAPACITY_CHECK_PATTERN`).
+def _integrate_discharge_ah(
+    time_s: np.ndarray, current_a: np.ndarray, current_sign: float, max_gap_s: float,
+) -> Tuple[float, float]:
+    """Integrate the discharging direction of one *contiguous* current trace.
 
-    Only the discharging direction is summed (`-current_sign * current_a`,
-    clipped to >=0) so that any brief charge/rest padding included in the
-    section doesn't partially cancel out the discharge capacity. Returns
-    None if the section is too short or the result is implausibly small
-    (near-zero net discharge), signalling "not a real capacity check" rather
-    than a genuine near-zero capacity.
+    Returns (discharged_ah, duration_s). Only the discharging direction is
+    summed (`-current_sign * current_a`, clipped to >=0) so that brief
+    charge/rest padding inside the section doesn't partially cancel out the
+    discharge capacity.
     """
-    if len(time_s) < 5:
-        return None
+    if len(time_s) < 2:
+        return 0.0, 0.0
     dt = np.diff(time_s, prepend=time_s[0])
     dt[0] = 0.0
     dt = np.clip(dt, 0.0, max_gap_s)
     discharge_a = np.clip(-current_sign * current_a, 0.0, None)
-    capacity_ah = float(np.sum(discharge_a * dt) / 3600.0)
-    return capacity_ah if capacity_ah > 0.1 else None
+    return float(np.sum(discharge_a * dt) / 3600.0), float(time_s[-1] - time_s[0])
+
+
+def _measured_capacity_ah(
+    time_s: np.ndarray,
+    current_a: np.ndarray,
+    current_sign: float,
+    max_gap_s: float = 300.0,
+    rated_capacity_ah: Optional[float] = None,
+    row_index: Optional[np.ndarray] = None,
+    label: str = "",
+) -> Optional[float]:
+    """Measure a cell's actual capacity from its `Cap_1C` capacity-check
+    section(s), for use as the SoC coulomb-counting denominator in place of
+    the fixed nominal rating (see `_CAPACITY_CHECK_PATTERN`).
+
+    The rows handed in are selected by a boolean mask over the stitched run,
+    and that selection is **not necessarily contiguous**: a measurement can
+    contain more than one capacity check (`Cap_1C` and `Cap_1C_2` both match
+    the substring pattern), and the mask then jumps across hours of
+    intervening drive-cycle/charge sections. Integrating such a selection as
+    if it were one trace both sums the separate checks into one impossibly
+    large capacity *and* charges up to `max_gap_s` worth of phantom current
+    at every discontinuity. `row_index` (the positions the mask selected)
+    is therefore used to split the selection back into contiguous runs, each
+    integrated on its own; the **median** run is returned, so a truncated or
+    corrupted check next to a good one does not drag the answer.
+
+    Every candidate run is validated before it can be returned:
+
+      * it must last at least `_MIN_CAPACITY_SECTION_S` and yield more than
+        `_MIN_CAPACITY_AH`, and
+      * its implied C-rate (`ah / hours`) must look like a ~1C discharge --
+        a *truncated* check (the cycler export cut short, or an intermediate
+        file missing from your copy of the dataset) integrates to a
+        plausible-looking-but-far-too-small number with nothing in the value
+        itself to give it away, and silently under-sizing the denominator
+        drives the reconstructed SoC hard into the [0, 1] clip, freezing
+        whole drive-cycle segments at exactly 0.0, and
+      * when `rated_capacity_ah` is known, it must land within
+        `_CAPACITY_PLAUSIBLE_RANGE` of it -- the LG HG2 loses a lot of
+        capacity in the cold, but not 10x, and it never *exceeds* its rating.
+
+    Returns None (with a warning naming `label`) if nothing survives, so the
+    caller falls back to the nominal rating rather than trusting a bad
+    measurement.
+    """
+    if len(time_s) < _MIN_CAPACITY_SECTION_ROWS:
+        return None
+    if row_index is None:
+        row_index = np.arange(len(time_s))
+
+    # Split the (possibly non-contiguous) selection into contiguous runs.
+    breaks = np.where(np.diff(row_index) != 1)[0] + 1
+    candidates: List[float] = []
+    rejected: List[str] = []
+    for chunk in np.split(np.arange(len(row_index)), breaks):
+        if len(chunk) < _MIN_CAPACITY_SECTION_ROWS:
+            continue
+        ah, duration_s = _integrate_discharge_ah(
+            time_s[chunk], current_a[chunk], current_sign, max_gap_s
+        )
+        hours = duration_s / 3600.0
+        if ah <= _MIN_CAPACITY_AH:
+            rejected.append(f"{ah:.3f} Ah over {hours:.2f} h (near-zero net discharge)")
+            continue
+        if not (_DURATION_PLAUSIBLE_H[0] <= hours <= _DURATION_PLAUSIBLE_H[1]):
+            rejected.append(f"{ah:.3f} Ah over {hours:.2f} h (a 1C check runs ~1 h, expected "
+                            f"{_DURATION_PLAUSIBLE_H[0]}-{_DURATION_PLAUSIBLE_H[1]} h -- "
+                            f"likely truncated or not a capacity check)")
+            continue
+        if rated_capacity_ah is not None:
+            c_rate = (ah / max(hours, 1e-9)) / rated_capacity_ah
+            if not (_C_RATE_PLAUSIBLE_RANGE[0] <= c_rate <= _C_RATE_PLAUSIBLE_RANGE[1]):
+                rejected.append(f"{ah:.3f} Ah over {hours:.2f} h (mean {c_rate:.2f}C, not a ~1C check)")
+                continue
+            lo, hi = _CAPACITY_PLAUSIBLE_RANGE
+            if not (lo * rated_capacity_ah <= ah <= hi * rated_capacity_ah):
+                rejected.append(f"{ah:.3f} Ah ({ah / rated_capacity_ah:.2f}x rated, outside "
+                                f"[{lo}, {hi}]x)")
+                continue
+        candidates.append(ah)
+
+    if not candidates:
+        if rejected:
+            print(f"[rtcqr.data] {label}: no usable Cap_1C section -- rejected "
+                  f"{len(rejected)} candidate(s): {'; '.join(rejected)}")
+        return None
+    if len(candidates) > 1:
+        print(f"[rtcqr.data] {label}: {len(candidates)} separate Cap_1C section(s) "
+              f"({[f'{c:.3f}' for c in candidates]}) -- using the median, not the sum.")
+    return float(np.median(candidates))
+
+
+def _warn_non_monotonic_capacity(capacity_by_condition: Dict[float, float]) -> None:
+    """Flag a measured capacity that falls as ambient temperature *rises*.
+
+    A Li-ion cell's usable capacity increases monotonically with temperature
+    across this dataset's range (roughly -20 to +40 degC) -- that is the whole
+    premise of measuring the denominator per condition. A reading that goes
+    the other way (e.g. 40 degC measuring *lower* than 25 degC) is therefore
+    not physics, it is a bad capacity check: a truncated section, a missing
+    intermediate file, or a sampling gap inside the check. Left unflagged it
+    silently under-sizes that condition's denominator and freezes its
+    drive-cycle segments at SoC=0.
+    """
+    conds = sorted(c for c in capacity_by_condition if c is not None)
+    for lo, hi in zip(conds, conds[1:]):
+        cap_lo, cap_hi = capacity_by_condition[lo], capacity_by_condition[hi]
+        if cap_hi < cap_lo * 0.98:
+            print(f"[rtcqr.data] WARNING: measured capacity DROPS with rising temperature "
+                  f"({lo} degC -> {cap_lo:.3f} Ah, {hi} degC -> {cap_hi:.3f} Ah). A cell's "
+                  f"capacity does not fall as it warms, so the {hi} degC Cap_1C section is "
+                  f"probably truncated or incomplete. Its SoC will bottom out at 0 too "
+                  f"early; consider --exclude-measurement-ids for that group, or supplying "
+                  f"the capacity manually via capacity_overrides.")
 
 
 def _parse_file_raw(path: str, overrides: Optional[Dict[str, str]]):
@@ -412,6 +551,32 @@ def _parse_file_raw(path: str, overrides: Optional[Dict[str, str]]):
     return frame, group_key, test_section, condition
 
 
+def _collapse_duplicate_timestamps(combined: pd.DataFrame) -> pd.DataFrame:
+    """Sort a stitched run by time and collapse rows sharing a timestamp by
+    *averaging* them, rather than keeping one and discarding the rest.
+
+    The cycler's "Time Stamp" column has one-second resolution (the
+    sub-second field lives in "Prog Time"/"Step Time", which are durations,
+    not absolute times, so they cannot order rows across files). The dynamic
+    drive-cycle sections are logged at ~0.1 s, so ~10 rows per second share a
+    timestamp. Dropping nine of them keeps one *instantaneous* sample and
+    then treats it as representative of the whole second -- decimation with
+    no anti-aliasing, which both throws away 90% of the V/I/T dynamics the
+    model is supposed to learn from and injects noise into the coulomb count,
+    since `current[i] * 1s` is then one instantaneous reading rather than
+    that second's mean current. Averaging keeps the charge integral right and
+    hands the model a properly band-limited 1 Hz signal.
+    """
+    combined = combined.sort_values("abs_time", kind="stable")
+    if not combined["abs_time"].duplicated().any():
+        return combined.reset_index(drop=True)
+    numeric = ["voltage", "current", "temperature", "soc_raw"]
+    agg = {c: "mean" for c in numeric}
+    agg["test_section"] = "first"  # a shared second straddling two sections: attribute it to the earlier
+    collapsed = combined.groupby("abs_time", as_index=False, sort=True).agg(agg)
+    return collapsed.reset_index(drop=True)
+
+
 def _resample_uniform(df: pd.DataFrame, dt_s: float) -> pd.DataFrame:
     """Resample a (time, voltage, current, temperature, soc) frame with
     monotonic but possibly irregular `time` onto a uniform grid via linear
@@ -450,6 +615,13 @@ class BatteryFile:
     path: str  # descriptive source label (measurement id / section list), for logging
     condition: Optional[float]  # nominal test temperature in degC, if inferable
     frame: pd.DataFrame  # columns: time, voltage, current, temperature, soc (time-sorted, uniform rate)
+    # Absolute wall-clock start of this segment. Kept because the conformal
+    # calibrator's exponential time decay (conformal.time_decay_weights)
+    # assumes its buffer is in chronological order; segments are otherwise
+    # emitted grouped by measurement and then randomly permuted by
+    # `segment_split`, which would make "recency" meaningless.
+    start_time: Optional[pd.Timestamp] = None
+    group_key: Optional[str] = None  # Measurement ID this segment came from
 
 
 def load_lg_hg2_dataframe(
@@ -461,6 +633,7 @@ def load_lg_hg2_dataframe(
     resample_dt_s: Optional[float] = 1.0,
     max_gap_s: float = 300.0,
     column_overrides: Optional[Dict[str, Dict[str, str]]] = None,
+    capacity_overrides: Optional[Dict[float, float]] = None,
 ) -> List[BatteryFile]:
     """Load and reconstruct every measurement run under `root` into a list
     of BatteryFile windowing segments. See the module docstring for the
@@ -485,8 +658,14 @@ def load_lg_hg2_dataframe(
     `column_overrides` maps a filename (basename) to a per-field column-name
     override dict, for files where auto-detection needs help, e.g.:
         {"553_Mixed2.csv": {"current": "Current(A)"}}
+
+    `capacity_overrides` maps an ambient condition (degC) to a capacity in Ah,
+    replacing whatever was measured for it. Use it when a condition's Cap_1C
+    section is truncated or missing from your copy of the dataset and the
+    loader warns about it, e.g. `{40.0: 2.80}`.
     """
     column_overrides = column_overrides or {}
+    capacity_overrides = capacity_overrides or {}
     paths = discover_csv_files(root)
 
     groups: Dict[str, List[dict]] = defaultdict(list)
@@ -507,8 +686,7 @@ def load_lg_hg2_dataframe(
     capacity_readings: Dict[float, List[float]] = defaultdict(list)
     for group_key, parts in groups.items():
         combined = pd.concat([p["frame"] for p in parts], ignore_index=True)
-        combined = combined.sort_values("abs_time").drop_duplicates(subset=["abs_time"], keep="first")
-        combined = combined.reset_index(drop=True)
+        combined = _collapse_duplicate_timestamps(combined)
         if len(combined) < 20:
             continue
 
@@ -527,10 +705,15 @@ def load_lg_hg2_dataframe(
         if condition is not None:
             cap_mask = combined["test_section"].apply(lambda s: _CAPACITY_CHECK_PATTERN in s.lower()).to_numpy()
             if cap_mask.any():
+                cap_rows = np.where(cap_mask)[0]
                 measured = _measured_capacity_ah(
-                    combined.loc[cap_mask, "time"].to_numpy(),
-                    combined.loc[cap_mask, "current"].to_numpy(),
-                    current_sign, max_gap_s=max_gap_s,
+                    combined["time"].to_numpy()[cap_rows],
+                    combined["current"].to_numpy()[cap_rows],
+                    current_sign,
+                    max_gap_s=max_gap_s,
+                    rated_capacity_ah=rated_capacity_ah,
+                    row_index=cap_rows,
+                    label=f"measurement {group_key} @ {condition} degC",
                 )
                 if measured is not None:
                     capacity_readings[condition].append(measured)
@@ -539,11 +722,22 @@ def load_lg_hg2_dataframe(
         condition_by_group[group_key] = condition
         section_list_by_group[group_key] = section_list
 
-    capacity_by_condition = {cond: float(np.mean(vals)) for cond, vals in capacity_readings.items()}
+    # Median, not mean: one measurement group with a truncated or doubled
+    # capacity check must not drag the denominator that every group at that
+    # condition shares.
+    capacity_by_condition = {cond: float(np.median(vals)) for cond, vals in capacity_readings.items()}
     for cond, vals in sorted(capacity_readings.items(), key=lambda kv: (kv[0] is None, kv[0])):
-        print(f"[rtcqr.data] condition={cond}: measured capacity {np.mean(vals):.3f} Ah "
-              f"(from {len(vals)} Cap_1C section(s): {[f'{v:.3f}' for v in vals]}), "
-              f"vs. rated_capacity_ah={rated_capacity_ah:.3f}")
+        spread = (max(vals) - min(vals)) / max(np.median(vals), 1e-9)
+        warn = "  <-- readings disagree by >20%, inspect them" if spread > 0.2 else ""
+        print(f"[rtcqr.data] condition={cond}: measured capacity {np.median(vals):.3f} Ah "
+              f"(median of {len(vals)} group(s): {[f'{v:.3f}' for v in vals]}), "
+              f"vs. rated_capacity_ah={rated_capacity_ah:.3f}{warn}")
+    for cond, cap in capacity_overrides.items():
+        prev = capacity_by_condition.get(cond)
+        capacity_by_condition[cond] = float(cap)
+        print(f"[rtcqr.data] condition={cond}: capacity overridden to {cap:.3f} Ah"
+              + (f" (was {prev:.3f} Ah measured)" if prev is not None else " (none measured)"))
+    _warn_non_monotonic_capacity(capacity_by_condition)
     warned_conditions: set = set()
 
     # Pass 2: compute SoC (per-group capacity denominator) and split into
@@ -563,9 +757,11 @@ def load_lg_hg2_dataframe(
         else:
             group_capacity_ah = capacity_by_condition.get(condition, rated_capacity_ah)
             if condition not in capacity_by_condition and condition not in warned_conditions:
-                print(f"[rtcqr.data] condition={condition}: no Cap_1C section found at this condition in any "
-                      f"measurement group -- falling back to rated_capacity_ah={rated_capacity_ah:.3f} Ah for SoC "
-                      f"normalization at this condition.")
+                print(f"[rtcqr.data] condition={condition}: no *usable* Cap_1C section at this condition "
+                      f"(absent, or present but rejected by the plausibility guards above) -- falling back to "
+                      f"rated_capacity_ah={rated_capacity_ah:.3f} Ah for SoC normalization here. If a section "
+                      f"was rejected as truncated, prefer capacity_overrides={{{condition}: <Ah>}} over this "
+                      f"fallback: the nominal rating overstates a cold cell's real capacity.")
                 warned_conditions.add(condition)
             soc = _compute_soc_from_current(
                 combined["time"].to_numpy(), combined["current"].to_numpy(),
@@ -581,12 +777,16 @@ def load_lg_hg2_dataframe(
             continue
 
         for seg in _split_contiguous(combined, keep_mask, max_gap_s):
+            seg_start = seg["abs_time"].iloc[0]
             seg = seg[["time", "voltage", "current", "temperature", "soc"]].reset_index(drop=True)
             if resample_dt_s:
                 seg = _resample_uniform(seg, resample_dt_s)
             if len(seg) < 20:
                 continue
-            out.append(BatteryFile(path=f"measurement {group_key} ({section_list})", condition=condition, frame=seg))
+            out.append(BatteryFile(
+                path=f"measurement {group_key} ({section_list})", condition=condition, frame=seg,
+                start_time=seg_start, group_key=str(group_key),
+            ))
 
     if not out:
         raise RuntimeError(
@@ -598,7 +798,7 @@ def load_lg_hg2_dataframe(
 
 def chronological_split(
     files: Sequence[BatteryFile], train_frac: float, val_frac: float
-) -> Tuple[List[pd.DataFrame], List[pd.DataFrame], List[pd.DataFrame]]:
+) -> Tuple[List[BatteryFile], List[BatteryFile], List[BatteryFile]]:
     """Split each segment's time series into train/val/test slices in time order.
 
     Appropriate for a dataset made of a small number of long, continuous
@@ -619,10 +819,36 @@ def chronological_split(
         n_train = int(round(n * train_frac))
         n_val = int(round(n * val_frac))
         df = bf.frame
-        train_parts.append(df.iloc[:n_train].reset_index(drop=True))
-        val_parts.append(df.iloc[n_train:n_train + n_val].reset_index(drop=True))
-        test_parts.append(df.iloc[n_train + n_val:].reset_index(drop=True))
+        for parts, sl in (
+            (train_parts, slice(None, n_train)),
+            (val_parts, slice(n_train, n_train + n_val)),
+            (test_parts, slice(n_train + n_val, None)),
+        ):
+            parts.append(replace(bf, frame=df.iloc[sl].reset_index(drop=True)))
     return train_parts, val_parts, test_parts
+
+
+def _split_counts(n: int, train_frac: float, val_frac: float, val_calib_fraction: float):
+    """Allocate `n` segments across train/val/calib/test, guaranteeing every
+    split gets at least one segment. Requires n >= 4."""
+    if n < 4:
+        raise ValueError(f"need at least 4 segments to form 4 non-empty splits, got {n}")
+    n_val_total = max(2, int(round(n * val_frac)))  # >=2 so val and calib each get one
+    n_val = max(1, int(round(n_val_total * (1.0 - val_calib_fraction))))
+    n_calib = max(1, n_val_total - n_val)
+    n_test = max(1, int(round(n * max(0.0, 1.0 - train_frac - val_frac))))
+    n_train = n - n_val - n_calib - n_test
+    while n_train < 1:  # tiny n: claw back from the largest non-minimal split
+        if n_test > 1:
+            n_test -= 1
+        elif n_val > 1:
+            n_val -= 1
+        elif n_calib > 1:
+            n_calib -= 1
+        else:
+            raise ValueError(f"cannot form 4 non-empty splits from {n} segments")
+        n_train = n - n_val - n_calib - n_test
+    return n_train, n_val, n_calib, n_test
 
 
 def segment_split(
@@ -631,61 +857,146 @@ def segment_split(
     val_frac: float,
     val_calib_fraction: float,
     seed: int = 42,
-) -> Tuple[List[pd.DataFrame], List[pd.DataFrame], List[pd.DataFrame], List[pd.DataFrame]]:
+    stratify_by_condition: bool = True,
+) -> Tuple[List[BatteryFile], List[BatteryFile], List[BatteryFile], List[BatteryFile]]:
     """Randomly assign *whole* segments to train / val_model / calib / test,
     instead of slicing each segment chronologically (see `chronological_split`
     for why that's wrong for this dataset). Every split then sees a
     representative mix of full charge/discharge trajectories rather than a
-    systematically biased SoC sub-range. Returns (train, val_model, calib,
-    test) frame lists directly, since calib is carved out of the same
-    segment-level split as val rather than by further slicing val segments
-    chronologically (which would reintroduce the same bias at a smaller
-    scale).
+    systematically biased SoC sub-range.
+
+    The assignment is **stratified by ambient condition** by default. A plain
+    random split over all segments at once leaves the calibration split
+    missing entire temperatures: with ~50-100 segments spread over this
+    dataset's six conditions, calib draws only ~7.5% of them, so in the large
+    majority of seeds the test set contains a temperature that calib never
+    saw. Conformal calibration's coverage guarantee rests on calib and test
+    being exchangeable, and this dataset's SoC/error distribution is strongly
+    temperature-dependent -- that is precisely why the coulomb-counting
+    denominator is measured per condition -- so calibrating -20 degC test
+    windows against a buffer containing no -20 degC data silently voids the
+    guarantee. Stratifying splits each condition independently, so every
+    condition present in test is represented in calib in the same proportion.
+
+    A condition with fewer than 4 segments cannot fill all four splits; those
+    segments go to train, which is the safe direction (it can only cost the
+    model examples, never break calib/test exchangeability).
+
+    Returns (train, val_model, calib, test) as BatteryFile lists, so callers
+    keep each segment's condition and absolute start time -- the latter is
+    needed to order the calibration buffer chronologically before the
+    conformal time decay is applied to it.
     """
     rng = np.random.default_rng(seed)
-    n = len(files)
-    order = rng.permutation(n)
+    files = list(files)
+    if len(files) < 4:
+        raise ValueError(
+            f"need at least 4 windowing segments to build train/val/calib/test, got {len(files)}. "
+            "Loosen --exclude-measurement-ids or include more test sections."
+        )
 
-    n_train = max(1, int(round(n * train_frac)))
-    n_val_total = max(1, int(round(n * val_frac)))
-    n_val = max(1, int(round(n_val_total * (1.0 - val_calib_fraction))))
-    n_calib = max(1, n_val_total - n_val)
-    n_train = min(n_train, max(1, n - n_val - n_calib - 1))  # leave >=1 segment for test
+    if stratify_by_condition:
+        strata: Dict[object, List[int]] = defaultdict(list)
+        for i, bf in enumerate(files):
+            strata[bf.condition].append(i)
+    else:
+        strata = {None: list(range(len(files)))}
 
-    train_idx = order[:n_train]
-    val_idx = order[n_train:n_train + n_val]
-    calib_idx = order[n_train + n_val:n_train + n_val + n_calib]
-    test_idx = order[n_train + n_val + n_calib:]
+    train_idx: List[int] = []
+    val_idx: List[int] = []
+    calib_idx: List[int] = []
+    test_idx: List[int] = []
+    undersized: List[object] = []
 
-    def frames(idx: np.ndarray) -> List[pd.DataFrame]:
-        return [files[i].frame for i in idx]
+    for cond in sorted(strata, key=lambda c: (c is None, c)):
+        idx = np.array(strata[cond])
+        order = idx[rng.permutation(len(idx))]
+        if len(order) < 4:
+            undersized.append(cond)
+            train_idx.extend(order.tolist())
+            continue
+        n_tr, n_va, n_ca, n_te = _split_counts(len(order), train_frac, val_frac, val_calib_fraction)
+        train_idx.extend(order[:n_tr].tolist())
+        val_idx.extend(order[n_tr:n_tr + n_va].tolist())
+        calib_idx.extend(order[n_tr + n_va:n_tr + n_va + n_ca].tolist())
+        test_idx.extend(order[n_tr + n_va + n_ca:].tolist())
 
-    return frames(train_idx), frames(val_idx), frames(calib_idx), frames(test_idx)
+    if undersized:
+        print(f"[rtcqr.data] condition(s) {undersized} have <4 segments; assigning them all to train "
+              f"(cannot fill calib/test without breaking exchangeability).")
+    if not test_idx or not calib_idx:
+        counts = {c: len(v) for c, v in sorted(strata.items(), key=lambda kv: (kv[0] is None, kv[0]))}
+        raise ValueError(
+            f"stratified split left calib or test empty: every condition has fewer than 4 segments "
+            f"(segments per condition: {counts}). Each condition needs >=4 to fill "
+            f"train/val/calib/test independently. Either supply more data (a smaller --window-size or "
+            f"--include-all yields more segments), or pass stratify_by_condition=False / "
+            f"--no-stratify to split across conditions -- but note that unstratified splits routinely "
+            f"put a temperature in test that calib never saw, which voids the conformal coverage "
+            f"guarantee for those windows."
+        )
+
+    def pick(idx: List[int]) -> List[BatteryFile]:
+        return [files[i] for i in idx]
+
+    return pick(train_idx), pick(val_idx), pick(calib_idx), pick(test_idx)
+
+
+def order_chronologically(files: Sequence[BatteryFile]) -> List[BatteryFile]:
+    """Sort segments by their absolute start time.
+
+    `conformal.time_decay_weights` weights a calibration buffer by position,
+    treating the last entry as "now" and decaying backwards. That is only
+    meaningful if the buffer is in chronological order. Segments come out of
+    the loader grouped by measurement (i.e. ordered by file path: temperature
+    folder, then measurement id) and are then randomly permuted by
+    `segment_split`, so without this the decay would weight an arbitrary
+    segment's tail as the most recent evidence. Segments with no known start
+    time sort last, preserving their relative order.
+    """
+    known = [bf for bf in files if bf.start_time is not None]
+    unknown = [bf for bf in files if bf.start_time is None]
+    return sorted(known, key=lambda bf: bf.start_time) + unknown
+
+
+def _as_frames(items: Sequence) -> List[pd.DataFrame]:
+    """Accept either BatteryFile objects or bare DataFrames."""
+    return [it.frame if isinstance(it, BatteryFile) else it for it in items]
 
 
 def make_windows(
-    frames: Sequence[pd.DataFrame], window_size: int, stride: int = 1
+    frames: Sequence, window_size: int, stride: int = 1
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Build sliding windows of (voltage, current, temperature) -> SoC at the window's last step.
 
     Returns X of shape (N, 3, window_size) and y of shape (N,).
+
+    Built with `sliding_window_view` rather than by appending one array per
+    window to a Python list: the list-of-arrays form peaks at ~2.3x the size
+    of the output array (every window is materialised separately before being
+    stacked into a second full copy) and is ~7x slower. At this dataset's
+    scale -- 1 Hz resampling with stride 1 over many hours of drive cycles --
+    the training split alone runs to hundreds of MB, so that peak is a real
+    out-of-memory risk on a modest machine, not just a speed problem.
     """
     xs, ys = [], []
-    for df in frames:
+    for df in _as_frames(frames):
         if len(df) < window_size:
             continue
-        v = df["voltage"].to_numpy(dtype=np.float32)
-        i = df["current"].to_numpy(dtype=np.float32)
-        t = df["temperature"].to_numpy(dtype=np.float32)
+        chans = np.stack([
+            df["voltage"].to_numpy(dtype=np.float32),
+            df["current"].to_numpy(dtype=np.float32),
+            df["temperature"].to_numpy(dtype=np.float32),
+        ], axis=0)
         soc = df["soc"].to_numpy(dtype=np.float32)
-        n = len(df)
-        for end in range(window_size - 1, n, stride):
-            start = end - window_size + 1
-            xs.append(np.stack([v[start:end + 1], i[start:end + 1], t[start:end + 1]], axis=0))
-            ys.append(soc[end])
+        # (channels, n, window) -> (n, channels, window); one row per window end.
+        win = np.lib.stride_tricks.sliding_window_view(chans, window_size, axis=1)
+        win = win.transpose(1, 0, 2)[::stride]
+        xs.append(win)
+        ys.append(soc[window_size - 1::stride])
     if not xs:
         raise RuntimeError("No windows could be built; window_size may exceed the shortest split length.")
-    return np.stack(xs, axis=0), np.asarray(ys, dtype=np.float32)
+    return np.ascontiguousarray(np.concatenate(xs, axis=0)), np.concatenate(ys).astype(np.float32)
 
 
 class Standardizer:

@@ -27,7 +27,13 @@ class RTCQRConfig:
     val_calib_fraction: float = 0.5  # fraction of the validation split reserved for conformal calibration
     train_frac: float = 0.70
     val_frac: float = 0.15
-    # test_frac is implicitly 1 - train_frac - val_frac, per file, in time order
+    # test_frac is implicitly 1 - train_frac - val_frac
+    stratify_by_condition: bool = True  # split each ambient temperature separately
+    # Apply split conformal's ceil((1-a)(n+1)) order statistic instead of the
+    # plain empirical quantile of eq. (25)-(26). Set False to reproduce the
+    # paper's formula exactly; True is the statistically correct choice and
+    # matters here because zeta caps the *effective* calibration count at ~99.
+    finite_sample_correction: bool = True
 
     # --- TCN backbone (Table I) ---
     in_channels: int = 3  # voltage, current, temperature
@@ -49,7 +55,15 @@ class RTCQRConfig:
     patience: int = 20
 
     # --- Composite loss, eq. (17) ---
-    lambda_nc: float = 1.0  # quantile-crossing penalty weight
+    # 0.0, not the paper's 1.0: model.TCNQuantileNet's head emits
+    # q[k] = q[k-1] + softplus(.), so quantile crossing is structurally
+    # impossible and this penalty is *exactly* zero -- zero value and zero
+    # gradient -- for every input. Keeping it at 1.0 changes no number and
+    # only costs autograd nodes. Restore 1.0 if you swap in an unconstrained
+    # head, where it does real work (it was not enough on its own here: the
+    # crossing rate was still ~14-15% with lambda_nc=1.0 once SoC started
+    # spanning the full [0, 1] range).
+    lambda_nc: float = 0.0  # quantile-crossing penalty weight
     lambda_l: float = 0.1  # lower-tail regularization weight
 
     # --- Violation-weighted time-adaptive conformal calibration, eq. (19)-(28) ---

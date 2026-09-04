@@ -16,13 +16,18 @@ from __future__ import annotations
 from .conformal import StaticVWTACCalibrator
 
 
-def make_cqr_calibrator(soc_min: float) -> StaticVWTACCalibrator:
-    return StaticVWTACCalibrator(soc_min=soc_min, zeta=1.0, gamma=0.0, wl0=1.0, wl1=1.0, wu=1.0)
+def make_cqr_calibrator(soc_min: float, finite_sample_correction: bool = True) -> StaticVWTACCalibrator:
+    return StaticVWTACCalibrator(soc_min=soc_min, zeta=1.0, gamma=0.0, wl0=1.0, wl1=1.0, wu=1.0,
+                                 finite_sample_correction=finite_sample_correction, name="cqr")
 
 
-def make_wcp_calibrator(soc_min: float, zeta: float = 0.98) -> StaticVWTACCalibrator:
-    return StaticVWTACCalibrator(soc_min=soc_min, zeta=zeta, gamma=0.0, wl0=1.0, wl1=1.0, wu=1.0)
+def make_wcp_calibrator(soc_min: float, zeta: float = 0.98,
+                        finite_sample_correction: bool = True) -> StaticVWTACCalibrator:
+    return StaticVWTACCalibrator(soc_min=soc_min, zeta=zeta, gamma=0.0, wl0=1.0, wl1=1.0, wu=1.0,
+                                 finite_sample_correction=finite_sample_correction, name="wcp")
 
 
-def make_rtcqr_calibrator(soc_min: float, zeta: float, gamma: float, wl0: float, wl1: float, wu: float) -> StaticVWTACCalibrator:
-    return StaticVWTACCalibrator(soc_min=soc_min, zeta=zeta, gamma=gamma, wl0=wl0, wl1=wl1, wu=wu)
+def make_rtcqr_calibrator(soc_min: float, zeta: float, gamma: float, wl0: float, wl1: float, wu: float,
+                          finite_sample_correction: bool = True) -> StaticVWTACCalibrator:
+    return StaticVWTACCalibrator(soc_min=soc_min, zeta=zeta, gamma=gamma, wl0=wl0, wl1=wl1, wu=wu,
+                                 finite_sample_correction=finite_sample_correction, name="rtcqr")

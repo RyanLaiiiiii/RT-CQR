@@ -23,10 +23,13 @@ LG 18650HG2 Li-ion battery dataset, following:
 - `rtcqr/metrics.py` — LVR, AIW, ACE, eq. (29).
 - `rtcqr/data.py` — LG 18650HG2 loading: auto-detected column mapping,
   grouping/stitching multi-file measurement runs in true chronological
-  order, coulomb-counting SoC computation, uniform-rate resampling,
-  chronological train/val/calib/test split, and sliding-window
-  construction.
+  order, per-condition measured-capacity SoC coulomb counting, uniform-rate
+  resampling, temperature-stratified train/val/calib/test splitting, and
+  sliding-window construction.
 - `train.py` — end-to-end training + calibration + evaluation CLI.
+- `tests/` — regression tests, run with `pytest`. Every test pins a bug that
+  used to corrupt results *silently* (a wrong capacity denominator does not
+  raise, it just moves every SoC label), so they are worth keeping green.
 
 ## Setup
 
@@ -35,6 +38,31 @@ pip install -r requirements.txt
 ```
 
 ## Getting the data
+
+### SoC labels and the capacity denominator
+
+There is no published SoC formula for this dataset, so the labels are
+reconstructed here by coulomb counting, and the denominator that turns
+accumulated charge into SoC is **measured per ambient condition** from that
+condition's `Cap_1C` capacity-check section rather than fixed at the 3.0 Ah
+nominal rating. The cell's usable capacity falls steeply in the cold, while
+the test protocol depletes the same fraction of *actual* capacity at every
+temperature, so a single fixed denominator lifts the reconstructed SoC floor
+well above 0 everywhere except the warmest condition.
+
+Because a wrong denominator moves every label without raising anything, the
+measurement is guarded: capacity checks are split into contiguous runs and
+reduced by median (a measurement with two `Cap_1C` sections must not have
+them summed), each candidate must last roughly the ~1 h a 1C discharge takes
+and land within a plausible multiple of the rating, and the loader warns if
+measured capacity *falls* as temperature rises -- which is physically
+backwards and means that condition's section is truncated. A denominator
+that is too small is the damaging direction: it drives SoC into the [0, 1]
+clip, freezing whole drive-cycle segments at exactly 0 and, because the clip
+is irreversible, corrupting everything after them in the same run. Check the
+per-condition capacities the loader prints before trusting a training run,
+and override a bad one with `capacity_overrides={40.0: 2.80}` rather than
+falling back to the nominal rating.
 
 The dataset is the LG 18650HG2 Li-ion battery cycler data collected by
 Dr. Phillip Kollmeyer at McMaster University, Hamilton, Ontario, Canada
@@ -197,22 +225,64 @@ quantile model. Results and the trained weights are written to
 
 ### Train/val/calib/test split
 
-By default (`--split-mode segment`), whole windowing segments are
-randomly assigned to train/val/calib/test. This matters because most
-segments in this dataset are short (a few hours), single charge/discharge
-cycles whose SoC declines from ~1.0 to some low point over their own
-duration. Slicing each segment chronologically (`--split-mode
-chronological`, the original approach) would systematically give train
-the high-SoC early portion and test the low-SoC late portion of every
-cycle -- confirmed on the full dataset: calib mean SoC 0.33 vs. test mean
-SoC 0.25, and a 24% quantile-crossing rate on test vs. 3% on calib. That
-breaks both generalization (train rarely sees low-SoC examples) and the
-conformal calibration exchangeability assumption (calib and test come
-from systematically different SoC populations), producing badly
-miscalibrated intervals (ACE far above 0, and a 95% PI narrower than the
-90% PI). `chronological` is kept for datasets made of a small number of
-long, continuous multi-profile sweeps, where 15% of one such sweep still
-spans a representative chunk of the SoC trajectory.
+By default (`--split-mode segment`), whole windowing segments are randomly
+assigned to train/val/calib/test, **stratified by ambient temperature**.
+
+Whole segments rather than time slices: most segments here are short single
+charge/discharge cycles whose SoC declines from ~1.0 to some low point.
+Slicing each one chronologically (`--split-mode chronological`)
+systematically gives train the high-SoC early portion and test the low-SoC
+late portion of every cycle -- confirmed on the full dataset: calib mean SoC
+0.33 vs. test mean SoC 0.25, and a 24% quantile-crossing rate on test vs. 3%
+on calib. That breaks both generalization and conformal exchangeability.
+`chronological` is kept for datasets made of a few long continuous sweeps.
+
+Stratified rather than globally random: calib draws only ~7.5% of segments,
+so over this dataset's six conditions an unstratified split leaves a whole
+temperature out of calib in almost every seed -- measured over 200 seeds with
+48-96 segments, the test set contained a temperature calib had never seen in
+93-100% of them. Conformal coverage assumes calib and test are exchangeable,
+and this dataset's error distribution is strongly temperature-dependent (that
+is exactly why the capacity denominator is measured per condition), so those
+windows get no guarantee at all. Stratifying splits each condition
+independently and drops that to 0%. `train.py` prints the per-condition
+segment counts for every split and warns if any condition still ends up in
+test but not calib. `--no-stratify` restores the old behaviour.
+
+### Calibration-buffer ordering and the effective sample size
+
+Two properties of eq. (22)'s exponential decay are worth knowing before
+reading any RT-CQR-vs-WCP-vs-CQR comparison:
+
+* **It reads buffer position as time.** Segments leave the loader grouped by
+  measurement and are then randomly permuted by the split, so `train.py`
+  sorts calibration segments by absolute start time before windowing them.
+  Without that sort the decay designates an arbitrary segment's tail as
+  "now", and the time-adaptive component weights an essentially random
+  subset.
+* **It caps the effective sample size at `(1+zeta)/(1-zeta)`** -- 99 samples
+  at `zeta=0.98`, independent of buffer size. 99% of the weight sits on
+  roughly the last 228 entries, and with stride-1 windows those overlap
+  almost completely, so the independent information is smaller still. Growing
+  the calibration set does not stabilise the radius. `train.py` prints the
+  effective count; read seed-to-seed differences between calibrators against
+  that number, not against the raw sample count.
+
+Relatedly, `weighted_quantile` applies split conformal's `ceil((1-a)(n+1))`
+order statistic rather than eq. (25)-(26)'s plain empirical quantile, which
+undercovers by ~1/(n_effective+1) -- about 1% here even with a six-figure
+buffer, feeding straight into the reported ACE. `--paper-quantile`
+reproduces the paper's formula exactly.
+
+### Window size vs. receptive field
+
+With the paper's four residual blocks and kernel size 3, the backbone's
+receptive field is **61 time steps**: `1 + 2 * sum_b (k-1) * 2^b`. The
+default `--window-size 100` therefore carries 39 steps per window that are
+stored, standardized, transferred to the device and convolved but cannot
+influence the prediction. Either pass `--window-size 61` to drop the dead
+history, or raise `num_blocks` to 5 (receptive field 125) to actually use a
+100-step window. `train.py` prints a warning naming both numbers.
 
 ### Reproducing the ablation study (Table IV)
 
@@ -228,27 +298,46 @@ python train.py --data-root /path/to/lg_hg2 --calibrators cqr --output-dir outpu
 ### Useful flags
 
 - `--window-size N` — length (in resampled seconds) of the input V/I/T
-  history window used to predict the current SoC (default 100).
+  history window (default 100; see the receptive-field note above).
 - `--resample-dt S` — uniform resampling interval in seconds before
   windowing (default 1.0); pass 0 to window over native sampling instead.
 - `--current-sign {1,-1}` — coulomb-counting sign convention (see above).
 - `--split-mode {segment,chronological}` — how train/val/calib/test are
   carved out (see above); default `segment`.
+- `--no-stratify` — split without stratifying by temperature. Not
+  recommended; see above.
+- `--paper-quantile` — use eq. (25)-(26)'s uncorrected empirical quantile.
+- `--point-baseline` — also train the deterministic point-estimation model
+  and report its LVR (the `Point` row of Table II).
 - `--include-all` — keep static characterization test sections instead of
   only dynamic drive-cycle profiles.
 - `--exclude-measurement-ids ID [ID ...]` — drop specific Measurement IDs
   entirely from the windowing segments.
 - `--calibrators rtcqr cqr wcp` — which calibration methods to report.
+- `--num-workers N` — DataLoader workers (default 0; the dataset is already
+  an in-RAM `TensorDataset`, so workers mostly add per-batch pickling —
+  measure before raising it).
 - `--max-epochs`, `--patience`, `--seed` — training controls.
+
+## Tests
+
+```bash
+pip install pytest && pytest
+```
 
 ## Method summary
 
 1. **Risk-aligned quantile learning** (eq. 16-18): a TCN jointly predicts
    the quantile set `T = {0.025, 0.05, 0.10, 0.15, 0.85, 0.90, 0.95, 0.975}`
    using a composite pinball loss with a quantile-crossing penalty and an
-   extra term penalizing `[SoC_min - q_{tau_l}]_+` at `tau_l = min(T)`, to
-   directly discourage predicted lower bounds from exceeding SoC_min when
-   the true SoC does not.
+   extra term penalizing `[SoC_min - q_{tau_l}]_+` at `tau_l = min(T)`. Per
+   eq. (18) that term is a surrogate for the lower-bound violation event
+   `{q_{tau_l} < SoC_min}`, so minimizing it pushes the predicted lower bound
+   *up*, toward SoC_min. Note this pulls against the LVR metric of eq. (29),
+   which counts samples where the true SoC is below SoC_min while the
+   predicted lower bound is not: raising `q_{tau_l}` mechanically increases
+   LVR. That tension is the paper's own; it is reproduced faithfully here
+   rather than silently "corrected". Ablate the term with `--no-ltr`.
 2. **Violation-weighted time-adaptive conformal calibration** (eq. 19-28):
    an asymmetric nonconformity score upweights lower-bound violations
    (`w_l^(1) >= w_l^(0) >= w_u`), and calibration samples are exponentially

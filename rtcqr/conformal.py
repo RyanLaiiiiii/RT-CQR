@@ -18,7 +18,7 @@ Calibrated interval via Minkowski addition, eq. (27)-(28):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -36,7 +36,7 @@ def nonconformity_scores(
     wl0: float,
     wl1: float,
     wu: float,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, np.ndarray]:
     """eq. (20). Returns (scores, violation_indicator)."""
     violation = (soc_true < soc_min).astype(np.float64)
     wl = lower_tail_weight(violation, wl0, wl1)
@@ -46,16 +46,56 @@ def nonconformity_scores(
     return scores, violation
 
 
-def weighted_quantile(scores: np.ndarray, weights: np.ndarray, level: float) -> float:
+def effective_sample_size(weights: np.ndarray) -> float:
+    """Kish effective sample size, (sum w)^2 / sum w^2.
+
+    For the exponential decay of eq. (22) this converges to (1+zeta)/(1-zeta)
+    regardless of buffer length -- 99 samples at zeta=0.98. See
+    `time_decay_weights`.
+    """
+    w = np.asarray(weights, dtype=np.float64)
+    denom = float(np.sum(w ** 2))
+    return float(np.sum(w) ** 2 / denom) if denom > 0 else 0.0
+
+
+def weighted_quantile(
+    scores: np.ndarray, weights: np.ndarray, level: float, finite_sample_correction: bool = True
+) -> float:
     """eq. (25)-(26): smallest score c such that the weighted CDF at c is >= level.
 
     `weights` must be non-negative and sum to (approximately) 1.
+
+    Split conformal prediction needs the ceil((1-alpha)(n+1))-th order
+    statistic, not the ceil((1-alpha)n)-th, for its coverage guarantee to
+    hold; taking the plain empirical quantile undercovers by roughly 1/(n+1).
+    Eq. (25)-(26) is written without that correction, so `finite_sample_correction`
+    exists to reproduce the paper exactly (False) or to be statistically
+    correct (True, the default). The weighted generalisation inflates the
+    requested level by one effective sample's worth of mass -- and the
+    *effective* count is what matters here: at zeta=0.98 it is ~99 no matter
+    how many calibration windows exist, so the deficit stays around 1% even
+    with a six-figure buffer, and feeds straight into the reported ACE.
     """
+    scores = np.asarray(scores, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    if scores.size == 0:
+        return 0.0
+    if finite_sample_correction:
+        n_eff = effective_sample_size(weights)
+        if n_eff > 0:
+            level = min(1.0, level * (n_eff + 1.0) / n_eff)
     order = np.argsort(scores, kind="stable")
     sorted_scores = scores[order]
-    sorted_weights = weights[order]
-    cum = np.cumsum(sorted_weights)
-    idx = np.searchsorted(cum, level, side="left")
+    cum = np.cumsum(weights[order])
+    if cum[-1] <= 0:
+        return float(sorted_scores[-1])
+    # Renormalise so the CDF ends at exactly 1.0, and compare with a small
+    # tolerance. Summing n weights of 1/n drifts by ~1e-13 by the tail, which
+    # is enough to push the selected order statistic off by one all on its
+    # own (visible from n~2000 up) -- the choice of interval must not depend
+    # on cumsum rounding.
+    cum /= cum[-1]
+    idx = int(np.searchsorted(cum, min(level, 1.0) - 1e-12, side="left"))
     idx = min(idx, len(sorted_scores) - 1)
     return float(sorted_scores[idx])
 
@@ -66,6 +106,19 @@ def time_decay_weights(n: int, zeta: float, gamma: float, violation: np.ndarray)
 
     lags[i] = n - 1 - i for i = 0..n-1 (0 = most recent sample), so
     gamma_i = zeta**lags[i] * (1 + gamma * violation[i]).
+
+    NOTE: this treats buffer *position* as time, so the caller must hand over
+    a chronologically ordered buffer. Segments come out of the loader grouped
+    by measurement and are randomly permuted by `data.segment_split`, so
+    train.py sorts the calibration segments with `data.order_chronologically`
+    before windowing them. Without that the decay would designate an
+    arbitrary segment's tail as "now" and the whole time-adaptive component
+    would be weighting noise.
+
+    Note also that the resulting effective sample size converges to
+    (1+zeta)/(1-zeta) independently of n -- 99 at zeta=0.98 -- so raising n
+    past a few hundred does not make the radius more stable. Use
+    `effective_sample_size` to see the number that actually governs it.
     """
     lags = np.arange(n - 1, -1, -1, dtype=np.float64)
     raw = (zeta ** lags) * (1.0 + gamma * violation.astype(np.float64))
@@ -90,15 +143,19 @@ class StaticVWTACCalibrator:
     case of the general time-adaptive calibrator below.
     """
 
-    def __init__(self, soc_min: float, zeta: float, gamma: float, wl0: float, wl1: float, wu: float):
+    def __init__(self, soc_min: float, zeta: float, gamma: float, wl0: float, wl1: float, wu: float,
+                 finite_sample_correction: bool = True, name: str = "calibrator"):
         self.soc_min = soc_min
         self.zeta = zeta
         self.gamma = gamma
         self.wl0 = wl0
         self.wl1 = wl1
         self.wu = wu
+        self.finite_sample_correction = finite_sample_correction
+        self.name = name
         self._scores: Optional[np.ndarray] = None
         self._weights: Optional[np.ndarray] = None
+        self.n_effective_: Optional[float] = None
 
     def fit(self, soc_calib: np.ndarray, q_lower_calib: np.ndarray, q_upper_calib: np.ndarray) -> "StaticVWTACCalibrator":
         scores, violation = nonconformity_scores(
@@ -107,11 +164,24 @@ class StaticVWTACCalibrator:
         n = len(scores)
         self._scores = scores
         self._weights = time_decay_weights(n, self.zeta, self.gamma, violation)
+        self.n_effective_ = effective_sample_size(self._weights)
+        # The exponential decay caps the effective sample count at
+        # (1+zeta)/(1-zeta) -- 99 at zeta=0.98 -- no matter how large the
+        # buffer is. Nothing here is wrong, but a radius estimated from ~99
+        # effective samples is roughly 15x noisier than one using the whole
+        # buffer, so a run whose calibrators differ mostly by seed should be
+        # read in the light of this number, not of `n`.
+        if n >= 20 and self.n_effective_ < 0.25 * n:
+            print(f"[rtcqr.conformal] {self.name}: zeta={self.zeta} reduces {n} calibration samples to "
+                  f"an effective {self.n_effective_:.0f}. The radius is set by roughly the most recent "
+                  f"{self.n_effective_:.0f} samples; with stride-1 windows those overlap heavily, so the "
+                  f"independent information is smaller still.")
         return self
 
     def radius(self, alpha: float) -> float:
         assert self._scores is not None, "call fit() first"
-        return weighted_quantile(self._scores, self._weights, 1.0 - alpha)
+        return weighted_quantile(self._scores, self._weights, 1.0 - alpha,
+                                 finite_sample_correction=self.finite_sample_correction)
 
     def calibrate_interval(self, q_lower: np.ndarray, q_upper: np.ndarray, alpha: float):
         c = self.radius(alpha)
@@ -140,7 +210,9 @@ class OnlineVWTACCalibrator:
         wl1: float,
         wu: float,
         max_history: int = 2000,
+        finite_sample_correction: bool = True,
     ):
+        self.finite_sample_correction = finite_sample_correction
         self.soc_min = soc_min
         self.zeta = zeta
         self.gamma = gamma
@@ -171,7 +243,8 @@ class OnlineVWTACCalibrator:
         scores = np.asarray(self._scores)
         violation = np.asarray(self._violations)
         weights = time_decay_weights(n, self.zeta, self.gamma, violation)
-        return weighted_quantile(scores, weights, 1.0 - alpha)
+        return weighted_quantile(scores, weights, 1.0 - alpha,
+                                 finite_sample_correction=self.finite_sample_correction)
 
     def calibrate_interval(self, q_lower: float, q_upper: float, alpha: float):
         c = self.radius(alpha)

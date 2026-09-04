@@ -22,7 +22,7 @@ import json
 import os
 import random
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -37,10 +37,11 @@ from rtcqr.data import (
     chronological_split,
     load_lg_hg2_dataframe,
     make_windows,
+    order_chronologically,
     segment_split,
 )
 from rtcqr.losses import composite_quantile_loss
-from rtcqr.metrics import summarize
+from rtcqr.metrics import lower_violation_rate, summarize
 from rtcqr.model import TCNQuantileNet
 
 
@@ -49,6 +50,34 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+# Smallest val_loss decrease treated as real progress. Shared by the LR
+# scheduler and the early-stopping counter so they cannot disagree.
+_MIN_VAL_IMPROVEMENT = 1e-6
+
+
+def _report_split_conditions(train, val, calib, test) -> None:
+    """Print each split's per-condition segment counts.
+
+    Conformal coverage assumes calib and test are exchangeable. This
+    dataset's error distribution is strongly temperature-dependent, so a
+    condition appearing in test but not in calib silently voids the
+    guarantee for those windows -- print the table so it is visible rather
+    than buried.
+    """
+    named = [("train", train), ("val", val), ("calib", calib), ("test", test)]
+    conds = sorted({bf.condition for _, split in named for bf in split},
+                   key=lambda c: (c is None, c))
+    header = "".join(f"{str(c) + 'C':>9}" for c in conds)
+    print(f"[rtcqr.train] segments per condition\n{'':<8}{header}")
+    for name, split in named:
+        counts = {c: sum(bf.condition == c for bf in split) for c in conds}
+        print(f"{name:<8}" + "".join(f"{counts[c]:>9}" for c in conds))
+    missing = {bf.condition for bf in test} - {bf.condition for bf in calib}
+    if missing:
+        print(f"[rtcqr.train] WARNING: condition(s) {sorted(missing, key=str)} appear in test but not in "
+              f"calib. Conformal coverage is not guaranteed for those windows.")
 
 
 def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include_all: bool = False,
@@ -77,17 +106,27 @@ def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include
         # calib. Assigning whole segments to a split instead keeps each
         # split's SoC distribution representative.
         train_frames, val_model_frames, calib_frames, test_frames = segment_split(
-            files, cfg.train_frac, cfg.val_frac, cfg.val_calib_fraction, seed=cfg.seed
+            files, cfg.train_frac, cfg.val_frac, cfg.val_calib_fraction, seed=cfg.seed,
+            stratify_by_condition=cfg.stratify_by_condition,
         )
     else:
         train_frames, val_frames, test_frames = chronological_split(files, cfg.train_frac, cfg.val_frac)
-        # further split each validation frame chronologically into model-val / calibration
+        # further split each validation segment chronologically into model-val / calibration
         val_model_frames, calib_frames = [], []
-        for df in val_frames:
-            n_val = len(df)
+        for bf in val_frames:
+            n_val = len(bf.frame)
             n_cal = int(round(n_val * cfg.val_calib_fraction))
-            val_model_frames.append(df.iloc[:n_val - n_cal].reset_index(drop=True))
-            calib_frames.append(df.iloc[n_val - n_cal:].reset_index(drop=True))
+            val_model_frames.append(replace(bf, frame=bf.frame.iloc[:n_val - n_cal].reset_index(drop=True)))
+            calib_frames.append(replace(bf, frame=bf.frame.iloc[n_val - n_cal:].reset_index(drop=True)))
+
+    # The conformal time decay (conformal.time_decay_weights) reads buffer
+    # position as time, weighting the last entries as "now". Segments arrive
+    # here grouped by measurement and then randomly permuted by
+    # segment_split, so without this sort the decay would treat an arbitrary
+    # segment's tail as the most recent evidence and WCP/RT-CQR's
+    # time-adaptive component would be weighting an essentially random subset.
+    calib_frames = order_chronologically(calib_frames)
+    _report_split_conditions(train_frames, val_model_frames, calib_frames, test_frames)
 
     X_train, y_train = make_windows(train_frames, cfg.window_size, cfg.stride)
     X_val, y_val = make_windows(val_model_frames, cfg.window_size, cfg.stride)
@@ -106,19 +145,26 @@ def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include
     }
 
 
-def train_model(cfg: RTCQRConfig, splits, device: torch.device, num_workers: int = 2) -> TCNQuantileNet:
+def _fit(cfg: RTCQRConfig, splits, device: torch.device, loss_fn, num_workers: int = 2,
+         tag: str = "rtcqr") -> TCNQuantileNet:
+    """Shared training loop: AMP, LR schedule, early stopping, best-state restore.
+
+    `loss_fn(y_true, model_output) -> scalar tensor` is the only thing that
+    differs between the quantile model and the point-estimation baseline.
+    """
     X_train, y_train = splits["train"]
     X_val, y_val = splits["val"]
 
     train_ds = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
     val_ds = TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val))
-    # pin_memory + non_blocking .to() below overlap the host->device copy with
-    # compute; num_workers>0 moves batch assembly off the main process so it
-    # doesn't serialize with GPU dispatch. Both only help when there's a GPU
-    # to keep fed -- on CPU they're neutral to slightly wasteful, hence the
-    # pin_memory/device gating below.
+    # pin_memory + non_blocking .to() overlap the host->device copy with
+    # compute. num_workers>0 moves batch assembly off the main process, but
+    # for an already-in-RAM TensorDataset it mostly adds per-batch pickling
+    # and IPC, so it defaults off (see --num-workers) -- measure before
+    # raising it.
     pin_memory = device.type == "cuda"
-    loader_kwargs = dict(num_workers=num_workers, pin_memory=pin_memory, persistent_workers=num_workers > 0)
+    loader_kwargs = dict(num_workers=num_workers, pin_memory=pin_memory,
+                         persistent_workers=num_workers > 0)
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
 
@@ -130,8 +176,18 @@ def train_model(cfg: RTCQRConfig, splits, device: torch.device, num_workers: int
         kernel_size=cfg.kernel_size,
         dropout=cfg.dropout,
     ).to(device)
+    model.warn_if_window_exceeds_receptive_field(cfg.window_size)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
+    # Same improvement threshold as the early-stopping test below (absolute
+    # 1e-6). With ReduceLROnPlateau's default relative 1e-4 the two disagree:
+    # a val_loss around 0.05 improving by 2e-6 counts as progress for early
+    # stopping but as a plateau for the scheduler, so the LR keeps halving
+    # while the patience counter keeps resetting and the run never stops
+    # early -- it just burns all max_epochs at a vanishing learning rate.
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=5,
+        threshold=_MIN_VAL_IMPROVEMENT, threshold_mode="abs",
+    )
 
     # Mixed precision only applies (and only helps) on CUDA; autocast/GradScaler
     # are harmless no-ops with enabled=False, so this is safe on CPU too.
@@ -144,53 +200,87 @@ def train_model(cfg: RTCQRConfig, splits, device: torch.device, num_workers: int
 
     for epoch in range(1, cfg.max_epochs + 1):
         model.train()
-        train_loss = 0.0
+        train_loss, train_seen = 0.0, 0
         for xb, yb in train_loader:
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                q_pred = model(xb)
-                loss = composite_quantile_loss(
-                    yb, q_pred, cfg.quantile_levels, cfg.soc_min, cfg.lambda_nc, cfg.lambda_l, cfg.tau_l_index
-                )
+                loss = loss_fn(yb, model(xb))
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             train_loss += loss.item() * xb.size(0)
-        train_loss /= len(train_ds)
+            train_seen += xb.size(0)
+        # Divide by the samples actually iterated, not len(train_ds):
+        # drop_last=True discards the final partial batch.
+        train_loss /= max(train_seen, 1)
 
         model.eval()
-        val_loss = 0.0
+        val_loss, val_seen = 0.0, 0
         with torch.no_grad():
             for xb, yb in val_loader:
                 xb = xb.to(device, non_blocking=True)
                 yb = yb.to(device, non_blocking=True)
                 with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                    q_pred = model(xb)
-                    loss = composite_quantile_loss(
-                        yb, q_pred, cfg.quantile_levels, cfg.soc_min, cfg.lambda_nc, cfg.lambda_l, cfg.tau_l_index
-                    )
+                    loss = loss_fn(yb, model(xb))
                 val_loss += loss.item() * xb.size(0)
-        val_loss /= len(val_ds)
+                val_seen += xb.size(0)
+        val_loss /= max(val_seen, 1)
         scheduler.step(val_loss)
 
         lr = optimizer.param_groups[0]["lr"]
-        print(f"[rtcqr.train] epoch {epoch:03d}  train_loss={train_loss:.5f}  val_loss={val_loss:.5f}  lr={lr:.2e}")
+        print(f"[rtcqr.train:{tag}] epoch {epoch:03d}  train_loss={train_loss:.5f}  "
+              f"val_loss={val_loss:.5f}  lr={lr:.2e}")
 
-        if val_loss < best_val - 1e-6:
+        if val_loss < best_val - _MIN_VAL_IMPROVEMENT:
             best_val = val_loss
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= cfg.patience:
-                print(f"[rtcqr.train] early stopping at epoch {epoch} (best val_loss={best_val:.5f})")
+                print(f"[rtcqr.train:{tag}] early stopping at epoch {epoch} (best val_loss={best_val:.5f})")
                 break
 
     if best_state is not None:
         model.load_state_dict(best_state)
     return model
+
+
+def train_model(cfg: RTCQRConfig, splits, device: torch.device, num_workers: int = 0) -> TCNQuantileNet:
+    return _fit(
+        cfg, splits, device, num_workers=num_workers, tag="rtcqr",
+        loss_fn=lambda y, q: composite_quantile_loss(
+            y, q, cfg.quantile_levels, cfg.soc_min, cfg.lambda_nc, cfg.lambda_l, cfg.tau_l_index
+        ),
+    )
+
+
+def train_point_model(cfg: RTCQRConfig, splits, device: torch.device, num_workers: int = 0) -> TCNQuantileNet:
+    """Train the deterministic point-estimation baseline of Table II.
+
+    Same TCN backbone, one output, MSE loss. The paper reports its LVR
+    (0.084 on this dataset) as the motivating comparison -- it is the row
+    showing that a model without uncertainty carries a persistent
+    minimum-SoC violation risk -- so without it the interval methods'
+    LVR numbers have nothing to be better *than*.
+
+    Implemented by reusing TCNQuantileNet with a single "quantile" level:
+    with one output the head is just `base` (no softplus increments), so
+    this is exactly the same architecture with a scalar output.
+    """
+    point_cfg = replace(cfg, quantile_levels=[0.5])
+    model = _fit(point_cfg, splits, device, num_workers=num_workers,
+                 loss_fn=lambda y, q: torch.nn.functional.mse_loss(q[:, 0], y),
+                 tag="point")
+    return model
+
+
+@torch.no_grad()
+def predict_point(model: TCNQuantileNet, X: np.ndarray, device: torch.device,
+                  batch_size: int = 256) -> np.ndarray:
+    return predict_quantiles(model, X, device, batch_size)[:, 0]
 
 
 @torch.no_grad()
@@ -215,12 +305,14 @@ def evaluate(cfg: RTCQRConfig, model: TCNQuantileNet, splits, device, calibrator
         results[pi_key] = {}
 
         for name in calibrators:
+            fsc = cfg.finite_sample_correction
             if name == "rtcqr":
-                calibrator = make_rtcqr_calibrator(cfg.soc_min, cfg.zeta, cfg.gamma, cfg.wl0, cfg.wl1, cfg.wu)
+                calibrator = make_rtcqr_calibrator(cfg.soc_min, cfg.zeta, cfg.gamma, cfg.wl0, cfg.wl1,
+                                                   cfg.wu, finite_sample_correction=fsc)
             elif name == "cqr":
-                calibrator = make_cqr_calibrator(cfg.soc_min)
+                calibrator = make_cqr_calibrator(cfg.soc_min, finite_sample_correction=fsc)
             elif name == "wcp":
-                calibrator = make_wcp_calibrator(cfg.soc_min, zeta=cfg.zeta)
+                calibrator = make_wcp_calibrator(cfg.soc_min, zeta=cfg.zeta, finite_sample_correction=fsc)
             else:
                 raise ValueError(f"Unknown calibrator {name!r}")
 
@@ -270,13 +362,27 @@ def main():
                               "measurement run before windowing (default 1.0). Pass 0 to disable resampling.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default="outputs")
-    parser.add_argument("--num-workers", type=int, default=2,
-                         help="DataLoader worker processes for batch assembly (default 2). Only matters with a "
-                              "GPU -- keeps the GPU fed instead of waiting on the main process to build each "
-                              "batch. Set to 0 to disable (e.g. if multiprocessing misbehaves in your environment).")
+    parser.add_argument("--num-workers", type=int, default=0,
+                         help="DataLoader worker processes for batch assembly (default 0). The dataset is "
+                              "already a fully in-RAM TensorDataset, so workers mostly add per-batch pickling "
+                              "and IPC rather than removing a bottleneck; raise it only if you measure a gain.")
+    parser.add_argument("--point-baseline", action="store_true",
+                         help="Also train the deterministic point-estimation model and report its LVR "
+                              "(the 'Point' row of Table II).")
+    parser.add_argument("--no-stratify", action="store_true",
+                         help="Split segments without stratifying by ambient temperature. Not recommended: "
+                              "unstratified splits routinely leave a temperature in test that calib never "
+                              "saw, which voids the conformal coverage guarantee for those windows.")
+    parser.add_argument("--paper-quantile", action="store_true",
+                         help="Use eq. (25)-(26)'s plain empirical quantile instead of split conformal's "
+                              "ceil((1-a)(n+1)) order statistic. Reproduces the paper exactly; undercovers.")
     args = parser.parse_args()
 
     cfg = RTCQRConfig(seed=args.seed)
+    if args.no_stratify:
+        cfg.stratify_by_condition = False
+    if args.paper_quantile:
+        cfg.finite_sample_correction = False
     if args.no_ltr:
         cfg.lambda_l = 0.0
     if args.max_epochs is not None:
@@ -307,13 +413,21 @@ def main():
     model = train_model(cfg, splits, device, num_workers=args.num_workers)
     print(f"[rtcqr.train] training finished in {time.time() - t0:.1f}s")
 
+    point_lvr = None
+    if args.point_baseline:
+        point_model = train_point_model(cfg, splits, device, num_workers=args.num_workers)
+        y_test = splits["test"][1]
+        point_pred = predict_point(point_model, splits["test"][0], device)
+        point_lvr = lower_violation_rate(y_test, point_pred, cfg.soc_min)
+
     results = evaluate(cfg, model, splits, device, calibrators=args.calibrators)
-    print_results_table(results)
+    print_results_table(results, point_lvr=point_lvr)
 
     os.makedirs(args.output_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(args.output_dir, "rtcqr_model.pt"))
     with open(os.path.join(args.output_dir, "results.json"), "w") as f:
-        json.dump({"config": asdict(cfg), "results": results}, f, indent=2)
+        json.dump({"config": asdict(cfg), "results": results, "point_lvr": point_lvr,
+                   "torch_version": torch.__version__}, f, indent=2)
     print(f"[rtcqr.train] saved model and results to {args.output_dir}/")
 
 

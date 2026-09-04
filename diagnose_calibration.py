@@ -52,10 +52,15 @@ def main():
     parser.add_argument("--window-size", type=int, default=None)
     parser.add_argument("--resample-dt", type=float, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no-stratify", action="store_true",
+                        help="Must match the flag train.py was run with, or the split will not "
+                             "reproduce and the loaded model will be evaluated on its own training data.")
     parser.add_argument("--model-path", type=str, default="outputs/rtcqr_model.pt")
     args = parser.parse_args()
 
     cfg = RTCQRConfig(seed=args.seed)
+    if args.no_stratify:
+        cfg.stratify_by_condition = False
     if args.window_size is not None:
         cfg.window_size = args.window_size
     if args.resample_dt is not None:
@@ -103,13 +108,21 @@ def main():
             q_lo, q_hi = q[:, idx_l], q[:, idx_u]
             lower_excess = np.clip(q_lo - y, 0.0, None)
             upper_excess = np.clip(y - q_hi, 0.0, None)
-            lower_wins = (lower_excess > upper_excess).mean()
+            # Compare the *weighted* branches, which is what max() actually
+            # sees: wl is 1.5 (or 3.0 on a violation sample) against wu=1.0,
+            # so comparing the raw excesses understates how often the
+            # lower-tail branch wins -- and how often it wins is precisely
+            # what decides whether rtcqr can differ from cqr/wcp at all.
+            wl = np.where(y < cfg.soc_min, cfg.wl1, cfg.wl0)
+            lower_wins = (wl * lower_excess > cfg.wu * upper_excess).mean()
+            lower_wins_unweighted = (lower_excess > upper_excess).mean()
             pi_key = f"{int(round((1 - alpha) * 100))}%"
             print(f"  [{pi_key} PI, tl={cfg.quantile_levels[idx_l]}, tu={cfg.quantile_levels[idx_u]}]")
             print(f"    {describe('lower_excess (q_lo - soc_true, if soc under-covered from below)', lower_excess)}")
             print(f"    {describe('upper_excess (soc_true - q_hi, if soc under-covered from above)', upper_excess)}")
-            print(f"    frac of samples where lower_excess > upper_excess (i.e. wl-branch would win the max): "
-                  f"{lower_wins:.4f}")
+            print(f"    frac of samples where the wl-branch wins the max (weighted, wl0={cfg.wl0}/"
+                  f"wl1={cfg.wl1} vs wu={cfg.wu}): {lower_wins:.4f}   [unweighted: "
+                  f"{lower_wins_unweighted:.4f}]")
 
     # Clip-pileup check: the capacity fix normalizes SoC against each
     # condition's *measured* capacity, and several segments' true depletion
