@@ -7,7 +7,7 @@ linear quantile head applied to the representation at the final time step.
 """
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -92,3 +92,32 @@ class TCNQuantileNet(nn.Module):
         h = self.tcn(x)          # (batch, channels, seq_len)
         h_last = h[:, :, -1]     # representation at the current (last) time step
         return self.head(h_last)  # (batch, num_quantiles)
+
+    def quantile_index(self, tau: float, tol: float = 1e-6) -> int:
+        """Column of `forward`'s output holding the tau-quantile."""
+        for i, level in enumerate(self.quantile_levels):
+            if abs(level - tau) < tol:
+                return i
+        raise ValueError(
+            f"Quantile level {tau} is not in this model's trained set {self.quantile_levels}. "
+            "The head emits a fixed set of levels, so an interval can only be formed at a "
+            "confidence level whose two boundary quantiles were trained."
+        )
+
+    def predict_interval(self, x: torch.Tensor, alpha: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The model's *uncalibrated* prediction interval at nominal
+        coverage 1 - alpha: [q_{alpha/2}, q_{1-alpha/2}].
+
+        This is the confidence level entering as an inference-time input.
+        The network itself is not conditioned on alpha -- it emits the whole
+        trained quantile set in one pass (eq. 14-15) and alpha selects which
+        pair bounds the interval -- so the same forward pass serves every
+        alpha whose boundary quantiles are in `quantile_levels`.
+
+        Note this is the interval *before* conformal calibration; RT-CQR's
+        VW-TAC step then widens it to [q_l - c_alpha, q_u + c_alpha].
+        """
+        q = self(x)
+        lower = q[:, self.quantile_index(alpha / 2.0)]
+        upper = q[:, self.quantile_index(1.0 - alpha / 2.0)]
+        return lower, upper

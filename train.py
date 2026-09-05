@@ -183,16 +183,58 @@ def predict_quantiles(model: TCNQuantileNet, X: np.ndarray, device: torch.device
     return np.concatenate(preds, axis=0)
 
 
+def report_interval_validity(cfg: RTCQRConfig, q_test: np.ndarray) -> Dict[str, float]:
+    """Check that the quantile head's raw output really is an interval.
+
+    The head is `nn.Linear(channels, len(quantile_levels))`: eight
+    independent projections with nothing tying them together. Monotonicity
+    across tau is encouraged only softly, by the `lambda_nc` crossing
+    penalty in eq. (17). When a pair does cross, `[q_tl, q_tu]` is an
+    inverted "interval" with negative width, and every metric computed
+    from it (AIW, ACE, and the conformal scores that add c_alpha to both
+    ends) is meaningless for that sample. Nothing downstream sorts or
+    clamps, so this is reported rather than silently repaired.
+
+    SoC is also physically confined to [0, 1] while the head is
+    unbounded, so out-of-range bounds are reported too.
+    """
+    stats = {
+        "crossing_any_adjacent_pair": float(np.mean(np.any(np.diff(q_test, axis=1) < 0, axis=1))),
+        "below_zero": float(np.mean(q_test < 0.0)),
+        "above_one": float(np.mean(q_test > 1.0)),
+    }
+    print("\n[rtcqr.train] pre-calibration quantile head sanity:")
+    print(f"  samples with >=1 crossed adjacent quantile pair: {stats['crossing_any_adjacent_pair'] * 100:.2f}%")
+    for alpha in cfg.pi_alphas:
+        idx_l, idx_u = cfg.quantile_bounds(alpha)
+        inverted = float(np.mean(q_test[:, idx_l] > q_test[:, idx_u]))
+        key = f"inverted_interval_{int(round((1 - alpha) * 100))}pct"
+        stats[key] = inverted
+        print(f"  inverted {int(round((1 - alpha) * 100))}% interval (q_l > q_u):        {inverted * 100:.2f}%")
+    print(f"  predicted quantiles outside [0, 1]: {stats['below_zero'] * 100:.2f}% below 0, "
+          f"{stats['above_one'] * 100:.2f}% above 1")
+    return stats
+
+
 def evaluate(cfg: RTCQRConfig, model: TCNQuantileNet, splits, device, calibrators: List[str]) -> Dict:
     (X_calib, y_calib), (X_test, y_test) = splits["calib"], splits["test"]
     q_calib = predict_quantiles(model, X_calib, device)
     q_test = predict_quantiles(model, X_test, device)
+
+    report_interval_validity(cfg, q_test)
 
     results: Dict[str, Dict[str, Dict[str, float]]] = {}
     for alpha in cfg.pi_alphas:
         idx_l, idx_u = cfg.quantile_bounds(alpha)
         pi_key = f"{int(round((1 - alpha) * 100))}%"
         results[pi_key] = {}
+
+        # The quantile model on its own, before any conformal step. This is
+        # the "w/o calibration" baseline the VW-TAC ablation is measured
+        # against, so it is always reported.
+        results[pi_key]["uncalibrated"] = summarize(
+            y_test, q_test[:, idx_l], q_test[:, idx_u], alpha, cfg.soc_min
+        )
 
         for name in calibrators:
             if name == "rtcqr":
@@ -215,12 +257,12 @@ def print_results_table(results: Dict, point_lvr: float = None):
     print("\n=== LG 18650HG2: LVR / AIW / ACE (lower is better) ===")
     for pi_key, per_calib in results.items():
         print(f"\n-- {pi_key} PI --")
-        header = f"{'method':<10}{'LVR':>10}{'AIW':>10}{'ACE':>10}"
+        header = f"{'method':<14}{'LVR':>10}{'AIW':>10}{'ACE':>10}"
         print(header)
         if point_lvr is not None:
-            print(f"{'Point':<10}{point_lvr:>10.3f}{'-':>10}{'-':>10}")
+            print(f"{'Point':<14}{point_lvr:>10.3f}{'-':>10}{'-':>10}")
         for name, m in per_calib.items():
-            print(f"{name:<10}{m['LVR']:>10.3f}{m['AIW']:>10.3f}{m['ACE']:>10.3f}")
+            print(f"{name:<14}{m['LVR']:>10.3f}{m['AIW']:>10.3f}{m['ACE']:>10.3f}")
 
 
 def main():
