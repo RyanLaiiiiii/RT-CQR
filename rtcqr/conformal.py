@@ -14,6 +14,38 @@ Calibrated radius as a weighted empirical quantile, eq. (25)-(26):
 
 Calibrated interval via Minkowski addition, eq. (27)-(28):
     PI^cal_t = [ q_tl,t - c_alpha,t , q_tu,t + c_alpha,t ]
+
+WHAT IS AND IS NOT GUARANTEED HERE
+
+The calibration and test sets in this setting are *not* exchangeable, and
+the paper says so explicitly (Sec. III.B.2): "Unlike classical conformal
+prediction, whose finite-sample coverage guarantee relies on
+exchangeability, the proposed calibration uses a time-decayed and
+violation-weighted empirical measure to target weighted empirical coverage
+rather than distribution-free finite-sample coverage."
+
+So RT-CQR and WCP deliberately trade the distribution-free guarantee for
+adaptivity to drift. Nothing in this module should be read as providing
+coverage in the split-conformal sense, and a calib/test mismatch does not
+"void a guarantee" -- there is none to void. What a mismatch does do is
+make the radius fitted on calib the wrong size for test, which shows up
+directly as ACE. Exchangeability fails here on several independent axes:
+
+  * stride-1 windows over 1 Hz data share all but one sample with their
+    neighbours, so the buffer is nowhere near i.i.d. (see
+    `effective_sample_size`);
+  * calibration and test come from different drive cycles under the
+    paper's fixed protocol (LA92 vs. US06/HWFET), i.e. different load
+    distributions by construction;
+  * the error distribution is strongly temperature-dependent; and
+  * calibration and test were recorded at different times, so any drift
+    or aging between them lands squarely in the calibration residuals.
+
+`weighted_quantile`'s finite-sample correction is a split-conformal device
+that assumes exchangeability, so here it is a small conservative
+adjustment rather than a guarantee. CQR (zeta=1, uniform weights) is the
+variant whose textbook guarantee would need exchangeability outright, and
+it does not hold on this data either.
 """
 from __future__ import annotations
 

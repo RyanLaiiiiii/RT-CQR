@@ -281,7 +281,8 @@ before reading any gap as a bug:
   intervals are sharp but badly calibrated, the opposite of Table II.
   Check the calib-vs-test SoC report printed by `train.py` first: a
   calibration set drawn from a different part of the SoC range than test
-  breaks exchangeability, and no calibrator recovers from that.
+  fits the radius on evidence test does not resemble, and no calibrator
+  recovers from that.
 
 The paper does not state `w_l^(0)`, `w_l^(1)`, or `w_u` — Table I lists
 only `lambda_nc`, `lambda_l`, `zeta`, and `gamma`, and eq. (21) only
@@ -315,7 +316,7 @@ cycle. Taking each cycle's tail rather than whole cycles keeps every
 temperature present in both halves — with one `LA92` cycle per
 temperature, assigning whole segments would leave conditions out of
 calibration, and a condition that reaches test without reaching calib gets
-no coverage guarantee at all. `train.py` prints both splits' SoC mean and
+a radius fitted on conditions unlike it. `train.py` prints both splits' SoC mean and
 range, and warns when they drift more than 0.1 apart, because that gap
 inflates ACE for every calibrator.
 
@@ -338,17 +339,18 @@ Slicing each one chronologically (`--split-mode chronological`)
 systematically gives train the high-SoC early portion and test the low-SoC
 late portion of every cycle -- confirmed on the full dataset: calib mean SoC
 0.33 vs. test mean SoC 0.25, and a 24% quantile-crossing rate on test vs. 3%
-on calib. That breaks both generalization and conformal exchangeability.
+on calib. That hurts generalization and fits the radius on the wrong part
+of the SoC range.
 `chronological` is kept for datasets made of a few long continuous sweeps.
 
 Stratified rather than globally random: calib draws only ~7.5% of segments,
 so over this dataset's six conditions an unstratified split leaves a whole
 temperature out of calib in almost every seed -- measured over 200 seeds with
 48-96 segments, the test set contained a temperature calib had never seen in
-93-100% of them. Conformal coverage assumes calib and test are exchangeable,
-and this dataset's error distribution is strongly temperature-dependent (that
-is exactly why the capacity denominator is measured per condition), so those
-windows get no guarantee at all. Stratifying splits each condition
+93-100% of them. This dataset's error distribution is strongly
+temperature-dependent (that is exactly why the capacity denominator is
+measured per condition), so those windows get a radius fitted entirely on
+conditions that behave differently. Stratifying splits each condition
 independently and drops that to 0%. `train.py` prints the per-condition
 segment counts for every split and warns if any condition still ends up in
 test but not calib. `--no-stratify` restores the old behaviour.

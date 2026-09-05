@@ -849,8 +849,8 @@ def chronological_split(
     systematically gives train the high-SoC early portion and test the
     low-SoC late portion of every cycle, so train rarely sees low-SoC
     examples and the calibration set's SoC distribution differs
-    systematically from the test set's -- breaking both generalization
-    and the conformal calibration exchangeability assumption.
+    systematically from the test set's -- hurting generalization and fitting
+    the conformal radius on a part of the SoC range test does not represent.
     """
     train_parts, val_parts, test_parts = [], [], []
     for bf in files:
@@ -909,17 +909,19 @@ def segment_split(
     missing entire temperatures: with ~50-100 segments spread over this
     dataset's six conditions, calib draws only ~7.5% of them, so in the large
     majority of seeds the test set contains a temperature that calib never
-    saw. Conformal calibration's coverage guarantee rests on calib and test
-    being exchangeable, and this dataset's SoC/error distribution is strongly
+    saw. This dataset's SoC/error distribution is strongly
     temperature-dependent -- that is precisely why the coulomb-counting
     denominator is measured per condition -- so calibrating -20 degC test
-    windows against a buffer containing no -20 degC data silently voids the
-    guarantee. Stratifying splits each condition independently, so every
-    condition present in test is represented in calib in the same proportion.
+    windows against a buffer containing no -20 degC data fits their radius
+    entirely on conditions that behave differently, and the error lands on
+    ACE. (The method does not claim distribution-free coverage to begin
+    with; see `conformal`'s module docstring.) Stratifying splits each
+    condition independently, so every condition present in test is
+    represented in calib in the same proportion.
 
     A condition with fewer than 4 segments cannot fill all four splits; those
-    segments go to train, which is the safe direction (it can only cost the
-    model examples, never break calib/test exchangeability).
+    segments go to train, which is the safe direction: it can only cost the
+    model examples, never leave a condition in test unrepresented in calib.
 
     Returns (train, val_model, calib, test) as BatteryFile lists, so callers
     keep each segment's condition and absolute start time -- the latter is
@@ -962,7 +964,7 @@ def segment_split(
 
     if undersized:
         print(f"[rtcqr.data] condition(s) {undersized} have <4 segments; assigning them all to train "
-              f"(cannot fill calib/test without breaking exchangeability).")
+              f"(cannot fill calib/test without leaving a condition unrepresented in calib).")
     if not test_idx or not calib_idx:
         counts = {c: len(v) for c, v in sorted(strata.items(), key=lambda kv: (kv[0] is None, kv[0]))}
         raise ValueError(
@@ -971,8 +973,8 @@ def segment_split(
             f"train/val/calib/test independently. Either supply more data (a smaller --window-size or "
             f"--include-all yields more segments), or pass stratify_by_condition=False / "
             f"--no-stratify to split across conditions -- but note that unstratified splits routinely "
-            f"put a temperature in test that calib never saw, which voids the conformal coverage "
-            f"guarantee for those windows."
+            f"put a temperature in test that calib never saw, so those windows get a radius fitted "
+            f"entirely on conditions that behave differently."
         )
 
     def pick(idx: List[int]) -> List[BatteryFile]:

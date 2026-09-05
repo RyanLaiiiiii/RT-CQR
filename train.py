@@ -102,11 +102,13 @@ def parse_capacity_overrides(values) -> Dict[float, float]:
 def _report_split_conditions(train, val, calib, test) -> None:
     """Print each split's per-condition segment counts.
 
-    Conformal coverage assumes calib and test are exchangeable. This
-    dataset's error distribution is strongly temperature-dependent, so a
-    condition appearing in test but not in calib silently voids the
-    guarantee for those windows -- print the table so it is visible rather
-    than buried.
+    This dataset's error distribution is strongly temperature-dependent, so
+    a condition appearing in test but not in calib gets a radius fitted on
+    conditions that behave differently from it -- print the table so that is
+    visible rather than buried. (Not a broken guarantee: per
+    `conformal`'s module docstring the method targets weighted empirical
+    coverage, not distribution-free coverage. It is an accuracy problem, and
+    it lands on ACE.)
     """
     named = [("train", train), ("val", val), ("calib", calib), ("test", test)]
     conds = sorted({bf.condition for _, split in named for bf in split},
@@ -123,7 +125,7 @@ def _report_split_conditions(train, val, calib, test) -> None:
     missing = {bf.condition for bf in test} - {bf.condition for bf in calib}
     if missing:
         print(f"[rtcqr.train] WARNING: condition(s) {sorted(missing, key=str)} appear in test but not in "
-              f"calib. Conformal coverage is not guaranteed for those windows.")
+              f"calib. Their radius is fitted entirely on conditions that behave differently.")
 
 
 def _carve_calibration(val_frames, val_calib_fraction: float):
@@ -134,7 +136,7 @@ def _carve_calibration(val_frames, val_calib_fraction: float):
     ambient condition represented in both halves -- with one validation cycle
     per temperature, assigning whole segments would leave conditions out of
     calibration entirely, and a condition that reaches test without reaching
-    calib gets no coverage guarantee at all.
+    calib gets a radius fitted on conditions unlike it.
     """
     val_model_frames, calib_frames = [], []
     for bf in val_frames:
@@ -148,10 +150,14 @@ def _carve_calibration(val_frames, val_calib_fraction: float):
 def _warn_if_calib_unrepresentative(calib_frames, test_frames) -> None:
     """Flag a calibration set whose SoC distribution does not look like test's.
 
-    Conformal coverage rests on calib and test being exchangeable. Carving
-    calibration from the tail of each validation cycle biases it toward the
-    low-SoC end of that cycle, while test spans whole cycles -- worth seeing
-    rather than inferring later from a large ACE.
+    Calib and test are never exchangeable here (see `conformal`'s module
+    docstring: the method targets weighted empirical coverage precisely
+    because they are not), so this is not a guarantee check. It is a
+    magnitude check: carving calibration from the tail of each validation
+    cycle biases it toward that cycle's low-SoC end while test spans whole
+    cycles, and the wider that gap, the more the fitted radius is simply the
+    wrong size for test -- worth seeing now rather than inferring later from
+    a large ACE.
     """
     calib_soc = np.concatenate([bf.frame["soc"].to_numpy() for bf in calib_frames])
     test_soc = np.concatenate([bf.frame["soc"].to_numpy() for bf in test_frames])
@@ -160,9 +166,9 @@ def _warn_if_calib_unrepresentative(calib_frames, test_frames) -> None:
           f"{calib_soc.max():.3f}]  test SoC mean={test_soc.mean():.3f} "
           f"range=[{test_soc.min():.3f},{test_soc.max():.3f}]")
     if gap > 0.1:
-        print(f"[rtcqr.train] WARNING: calib and test mean SoC differ by {gap:.3f}. Conformal coverage "
-              f"assumes the two are exchangeable, so a gap this size inflates ACE for every calibrator. "
-              f"Lower --val-calib-fraction to keep more of each validation cycle in calibration.")
+        print(f"[rtcqr.train] WARNING: calib and test mean SoC differ by {gap:.3f}. The radius is fitted "
+              f"on a part of the SoC range test does not represent, which inflates ACE for every "
+              f"calibrator. Lower --val-calib-fraction to keep more of each validation cycle in calibration.")
 
 
 def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include_all: bool = False,
@@ -549,7 +555,7 @@ def main():
     parser.add_argument("--no-stratify", action="store_true",
                          help="Split segments without stratifying by ambient temperature. Not recommended: "
                               "unstratified splits routinely leave a temperature in test that calib never "
-                              "saw, which voids the conformal coverage guarantee for those windows.")
+                              "saw, so those windows get a radius fitted on conditions unlike them.")
     parser.add_argument("--paper-quantile", action="store_true",
                          help="Use eq. (25)-(26)'s plain empirical quantile instead of split conformal's "
                               "ceil((1-a)(n+1)) order statistic. Reproduces the paper exactly; undercovers.")
