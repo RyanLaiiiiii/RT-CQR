@@ -1,9 +1,18 @@
 """Temporal convolutional network backbone with a multi-quantile output head.
 
 Matches the RT-CQR* backbone in Table I: 4 residual blocks, 64 channels per
-block, kernel size 3, dropout 0.1, causal dilated convolutions (dilation
-doubling per block), a Chomp1d layer to keep convolutions causal, and a
-linear quantile head applied to the representation at the final time step.
+block, kernel size 3, dropout 0.1, causal dilated convolutions, a Chomp1d
+layer to keep convolutions causal, and a linear quantile head applied to
+the representation at the final time step.
+
+Table I fixes the block count but not the dilation schedule, and the two
+interact through the causal receptive field
+`1 + 2*(kernel_size-1)*sum(dilations)`. With the textbook doubling
+schedule {1,2,4,8} four blocks reach only 61 steps, far short of the
+k = 400 window used by the protocol RT-CQR cites for its data split
+(Hannan et al., Sci. Rep. 11:19541, 2021). `dilation_base` therefore
+defaults to 4, giving {1,4,16,64} and a 341-step field, which keeps
+Table I's four blocks while getting within reach of that window.
 """
 from __future__ import annotations
 
@@ -75,18 +84,23 @@ class TCNQuantileNet(nn.Module):
         channels: int = 64,
         kernel_size: int = 3,
         dropout: float = 0.1,
+        dilation_base: int = 4,
     ):
         super().__init__()
         self.quantile_levels = list(quantile_levels)
+        self.dilation_base = dilation_base
 
         layers = []
         c_in = in_channels
         for b in range(num_blocks):
-            dilation = 2 ** b
+            dilation = dilation_base ** b
             layers.append(TemporalBlock(c_in, channels, kernel_size, dilation, dropout))
             c_in = channels
         self.tcn = nn.Sequential(*layers)
         self.head = nn.Linear(channels, len(self.quantile_levels))
+        self.receptive_field = 1 + 2 * (kernel_size - 1) * sum(
+            dilation_base ** b for b in range(num_blocks)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.tcn(x)          # (batch, channels, seq_len)

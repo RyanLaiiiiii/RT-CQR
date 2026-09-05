@@ -99,7 +99,7 @@ def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include
     X_calib, y_calib = make_windows(calib_frames, cfg.window_size, cfg.calib_stride or cfg.window_size)
     X_test, y_test = make_windows(test_frames, cfg.window_size, stride=1)
 
-    scaler = Standardizer().fit(X_train)
+    scaler = Standardizer(cfg.normalize).fit(X_train)
     X_train, X_val, X_calib, X_test = (scaler.transform(x) for x in (X_train, X_val, X_calib, X_test))
 
     print(f"[rtcqr.train] windows: train={len(y_train)} val={len(y_val)} calib={len(y_calib)} test={len(y_test)}")
@@ -127,7 +127,16 @@ def train_model(cfg: RTCQRConfig, splits, device: torch.device) -> TCNQuantileNe
         channels=cfg.channels,
         kernel_size=cfg.kernel_size,
         dropout=cfg.dropout,
+        dilation_base=cfg.dilation_base,
     ).to(device)
+    dilations = [cfg.dilation_base ** b for b in range(cfg.num_blocks)]
+    history_s = cfg.window_size * (cfg.resample_dt_s or 1.0)
+    print(f"[rtcqr.train] TCN dilations={dilations} receptive_field={model.receptive_field} "
+          f"window_size={cfg.window_size} ({history_s:.0f}s of history at "
+          f"{cfg.resample_dt_s or 1.0}s sampling); inputs scaled by '{cfg.normalize}'")
+    if model.receptive_field < cfg.window_size:
+        print(f"[rtcqr.train] WARNING: the first {cfg.window_size - model.receptive_field} step(s) of every "
+              f"window are outside the receptive field and cannot affect the prediction.")
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     best_val = float("inf")
@@ -306,6 +315,11 @@ def main():
                               "[.]_+, letting c_alpha go negative so calibration can tighten as well "
                               "as widen. Not eq. (20); for comparison only. CQR/WCP always use the "
                               "signed score, per Table I.")
+    parser.add_argument("--normalize", choices=["minmax", "zscore"], default=None,
+                         help="Input scaling fit on the training windows (default minmax, eq. (1) of [6]).")
+    parser.add_argument("--dilation-base", type=int, default=None,
+                         help="Dilation of TCN block b is base**b (default 4 -> {1,4,16,64}, receptive "
+                              "field 341). Base 2 gives the textbook {1,2,4,8} and a field of only 61.")
     parser.add_argument("--train-stride", type=int, default=None,
                          help="Stride between training/validation windows (default 1). Consecutive "
                               "stride-1 windows overlap by window_size-1 samples, so a larger stride "
@@ -336,6 +350,10 @@ def main():
         cfg.signed_score = True
     if args.train_stride is not None:
         cfg.stride = args.train_stride
+    if args.normalize is not None:
+        cfg.normalize = args.normalize
+    if args.dilation_base is not None:
+        cfg.dilation_base = args.dilation_base
 
     set_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -13,13 +13,16 @@ from typing import List, Optional
 @dataclass
 class RTCQRConfig:
     # --- Data / windowing ---
-    # Table I fixes the backbone at 4 residual blocks / kernel 3, whose causal
-    # receptive field is 1 + 2*(k-1)*sum(dilations) = 61 steps. A longer window
-    # is literally invisible to the head (verified by gradient: at window 100
-    # only steps 39..99 have non-zero gradient), so the window matches the field.
-    window_size: int = 61
+    # Set to the backbone's causal receptive field (see dilation_base): steps
+    # older than that are literally invisible to the head, so a longer window is
+    # only wasted compute. With 4 blocks / kernel 3 / dilation base 4 the field
+    # is 1 + 2*(3-1)*(1+4+16+64) = 341.
+    window_size: int = 341
     stride: int = 1  # between training/validation windows
     resample_dt_s: Optional[float] = 1.0  # uniform resampling interval (s) applied before windowing
+    # [6] eq. (1) min-max normalizes each channel to [0,1]; "zscore" is the
+    # per-channel standardization used before. Statistics are fit on train only.
+    normalize: str = "minmax"
     # None = measure the usable 1C capacity at each test temperature from
     # that temperature's own Cap_1C/C20DisCh section. A fixed nameplate
     # 3.0 Ah labels an empty cell (2.8 V cut-off) as SoC 0.12 at 25 degC
@@ -50,6 +53,9 @@ class RTCQRConfig:
     channels: int = 64
     kernel_size: int = 3
     dropout: float = 0.1
+    # Dilation of block b is dilation_base**b. Table I fixes num_blocks but not
+    # this; base 2 ({1,2,4,8}) reaches only 61 steps, base 4 ({1,4,16,64}) 341.
+    dilation_base: int = 4
 
     # --- Optimization ---
     lr: float = 1e-3

@@ -817,20 +817,34 @@ def make_windows(
 
 
 class Standardizer:
-    """Per-channel z-score standardization fit on the training windows only."""
+    """Per-channel input scaling, fit on the training windows only.
 
-    def __init__(self):
-        self.mean_: Optional[np.ndarray] = None
-        self.std_: Optional[np.ndarray] = None
+    "minmax" is eq. (1) of [6], `(x - min) / (max - min)` per channel, which
+    is what the protocol RT-CQR follows uses. "zscore" is per-channel
+    standardization. Either way the statistics come from the training
+    windows alone, so no test information leaks in; test values outside the
+    training range simply fall outside [0, 1] rather than being clipped.
+    """
+
+    def __init__(self, mode: str = "minmax"):
+        if mode not in ("minmax", "zscore"):
+            raise ValueError(f"mode must be 'minmax' or 'zscore', got {mode!r}")
+        self.mode = mode
+        self.offset_: Optional[np.ndarray] = None
+        self.scale_: Optional[np.ndarray] = None
 
     def fit(self, x: np.ndarray) -> "Standardizer":
-        self.mean_ = x.mean(axis=(0, 2), keepdims=True)
-        self.std_ = x.std(axis=(0, 2), keepdims=True)
-        self.std_[self.std_ < 1e-6] = 1.0
+        if self.mode == "minmax":
+            self.offset_ = x.min(axis=(0, 2), keepdims=True)
+            self.scale_ = x.max(axis=(0, 2), keepdims=True) - self.offset_
+        else:
+            self.offset_ = x.mean(axis=(0, 2), keepdims=True)
+            self.scale_ = x.std(axis=(0, 2), keepdims=True)
+        self.scale_ = np.where(np.abs(self.scale_) < 1e-6, 1.0, self.scale_)
         return self
 
     def transform(self, x: np.ndarray) -> np.ndarray:
-        return (x - self.mean_) / self.std_
+        return (x - self.offset_) / self.scale_
 
 
 def _inspect(root: str, include_all: bool) -> None:
