@@ -43,7 +43,7 @@ def nonconformity_scores(
     wl0: float,
     wl1: float,
     wu: float,
-    signed_score: bool = True,
+    signed_score: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """eq. (20). Returns (scores, violation_indicator).
 
@@ -126,7 +126,7 @@ class StaticVWTACCalibrator:
     """
 
     def __init__(self, soc_min: float, zeta: float, gamma: float, wl0: float, wl1: float, wu: float,
-                 signed_score: bool = True):
+                 signed_score: bool = False):
         self.soc_min = soc_min
         self.zeta = zeta
         self.gamma = gamma
@@ -178,7 +178,7 @@ class OnlineVWTACCalibrator:
         wl1: float,
         wu: float,
         max_history: int = 2000,
-        signed_score: bool = True,
+        signed_score: bool = False,
     ):
         self.soc_min = soc_min
         self.zeta = zeta
