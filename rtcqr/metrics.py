@@ -24,6 +24,20 @@ def average_coverage_error(soc_true: np.ndarray, q_lower: np.ndarray, q_upper: n
     return float(abs(empirical - nominal_coverage))
 
 
+def quantile_crossing_rate(q_pred: np.ndarray) -> float:
+    """Fraction of samples where any adjacent quantile pair is out of order.
+
+    `q_pred` is (n_samples, |T|) with `quantile_levels` sorted ascending, so
+    a well-formed row is non-decreasing left to right.
+
+    Not one of the paper's three metrics, but the number that decides
+    whether the monotone head is still needed: it is identically 0 against
+    that head, and only informative under `--unconstrained-head`, where
+    lambda_nc alone has to keep the quantiles ordered.
+    """
+    return float(np.mean(np.any(np.diff(q_pred, axis=1) < 0.0, axis=1)))
+
+
 def summarize(soc_true: np.ndarray, q_lower: np.ndarray, q_upper: np.ndarray, alpha: float, soc_min: float) -> dict:
     return {
         "LVR": lower_violation_rate(soc_true, q_lower, soc_min),

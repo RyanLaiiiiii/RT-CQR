@@ -50,7 +50,7 @@ from rtcqr.data import (
     segment_split,
 )
 from rtcqr.losses import composite_quantile_loss
-from rtcqr.metrics import lower_violation_rate, summarize
+from rtcqr.metrics import lower_violation_rate, quantile_crossing_rate, summarize
 from rtcqr.model import TCNQuantileNet
 
 
@@ -270,6 +270,7 @@ def _fit(cfg: RTCQRConfig, splits, device: torch.device, loss_fn, num_workers: i
         channels=cfg.channels,
         kernel_size=cfg.kernel_size,
         dropout=cfg.dropout,
+        monotone_head=cfg.monotone_head,
     ).to(device)
     model.warn_if_window_exceeds_receptive_field(cfg.window_size)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -388,10 +389,19 @@ def predict_quantiles(model: TCNQuantileNet, X: np.ndarray, device: torch.device
     return np.concatenate(preds, axis=0)
 
 
-def evaluate(cfg: RTCQRConfig, model: TCNQuantileNet, splits, device, calibrators: List[str]) -> Dict:
+def evaluate(cfg: RTCQRConfig, model: TCNQuantileNet, splits, device,
+             calibrators: List[str]) -> Tuple[Dict, Dict[str, float]]:
+    """Returns (per-PI/per-calibrator metrics, quantile-crossing rates)."""
     (X_calib, y_calib), (X_test, y_test) = splits["calib"], splits["test"]
     q_calib = predict_quantiles(model, X_calib, device)
     q_test = predict_quantiles(model, X_test, device)
+
+    # Reported for every run, but only ever non-zero under
+    # --unconstrained-head: the default head cannot produce a crossing.
+    crossing = {"calib": quantile_crossing_rate(q_calib), "test": quantile_crossing_rate(q_test)}
+    head = "unconstrained" if not cfg.monotone_head else "monotone"
+    print(f"[rtcqr.train] quantile-crossing rate ({head} head, lambda_nc={cfg.lambda_nc}): "
+          f"calib={crossing['calib']:.4f}  test={crossing['test']:.4f}")
 
     results: Dict[str, Dict[str, Dict[str, float]]] = {}
     for alpha in cfg.pi_alphas:
@@ -415,7 +425,7 @@ def evaluate(cfg: RTCQRConfig, model: TCNQuantileNet, splits, device, calibrator
             lo, hi = calibrator.calibrate_interval(q_test[:, idx_l], q_test[:, idx_u], alpha)
             results[pi_key][name] = summarize(y_test, lo, hi, alpha, cfg.soc_min)
 
-    return results
+    return results, crossing
 
 
 def print_results_table(results: Dict, point_lvr: float = None):
@@ -453,6 +463,14 @@ def aggregate_runs(per_seed: List[Dict]) -> Dict:
     return agg
 
 
+def _agg_scalar(values: List[float]) -> Dict[str, float]:
+    return {
+        "mean": float(np.mean(values)),
+        "std": float(np.std(values, ddof=1)) if len(values) > 1 else 0.0,
+        "n": len(values),
+    }
+
+
 def print_aggregate_table(agg: Dict, point_lvrs: Optional[List[float]] = None):
     n = next(iter(next(iter(agg.values())).values()))["LVR"]["n"]
     print(f"\n=== LG 18650HG2: mean +/- std over {n} seed(s) (lower is better) ===")
@@ -468,7 +486,8 @@ def print_aggregate_table(agg: Dict, point_lvrs: Optional[List[float]] = None):
             print(f"{method:<10}{cells}")
 
 
-def run_once(cfg: RTCQRConfig, data_root: str, args, device: torch.device) -> Tuple[Dict, Optional[float], TCNQuantileNet]:
+def run_once(cfg: RTCQRConfig, data_root: str, args,
+             device: torch.device) -> Tuple[Dict, Optional[float], Dict[str, float], TCNQuantileNet]:
     """One full train -> calibrate -> evaluate pass at cfg.seed."""
     set_seed(cfg.seed)
     splits = build_windows(cfg, data_root, current_sign=args.current_sign, include_all=args.include_all,
@@ -485,8 +504,8 @@ def run_once(cfg: RTCQRConfig, data_root: str, args, device: torch.device) -> Tu
         point_pred = predict_point(point_model, splits["test"][0], device)
         point_lvr = lower_violation_rate(splits["test"][1], point_pred, cfg.soc_min)
 
-    results = evaluate(cfg, model, splits, device, calibrators=args.calibrators)
-    return results, point_lvr, model
+    results, crossing = evaluate(cfg, model, splits, device, calibrators=args.calibrators)
+    return results, point_lvr, crossing, model
 
 
 def main():
@@ -514,6 +533,13 @@ def main():
                               "10 25 40 to include 40 degC as well.")
     parser.add_argument("--calibrators", nargs="+", default=["rtcqr", "cqr", "wcp"], choices=["rtcqr", "cqr", "wcp"])
     parser.add_argument("--no-ltr", action="store_true", help="Ablation: disable the lower-tail regularizer (lambda_l=0).")
+    parser.add_argument("--unconstrained-head", action="store_true",
+                         help="Use the paper's own quantile head -- |T| unconstrained outputs with crossing "
+                              "only penalized, at Table I's lambda_nc=1.0 -- instead of this repo's "
+                              "monotone (cumulative-softplus) head, which makes crossing impossible. The "
+                              "monotone head was adopted after a ~14-15%% crossing rate measured while the "
+                              "SoC labels were still clipping at 0; that has since been fixed, so run this "
+                              "and compare the reported crossing rate before assuming it is still needed.")
     parser.add_argument("--max-epochs", type=int, default=None)
     parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--window-size", type=int, default=None)
@@ -575,6 +601,12 @@ def main():
         cfg.finite_sample_correction = False
     if args.no_ltr:
         cfg.lambda_l = 0.0
+    if args.unconstrained_head:
+        # lambda_nc is the only thing keeping the quantiles ordered without
+        # the monotone head, so the two move together -- Table I's value.
+        cfg.monotone_head = False
+        cfg.lambda_nc = 1.0
+        print("[rtcqr.train] using the paper's unconstrained quantile head with lambda_nc=1.0")
     if args.max_epochs is not None:
         cfg.max_epochs = args.max_epochs
     if args.patience is not None:
@@ -600,15 +632,17 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     per_seed: Dict[str, Dict] = {}
     point_lvrs: List[float] = []
+    crossings: List[Dict[str, float]] = []
 
     for i, seed in enumerate(seeds):
         if len(seeds) > 1:
             print(f"\n{'=' * 70}\n[rtcqr.train] seed {seed}  ({i + 1}/{len(seeds)})\n{'=' * 70}")
         run_cfg = replace(cfg, seed=seed)
-        results, point_lvr, model = run_once(run_cfg, data_root, args, device)
+        results, point_lvr, crossing, model = run_once(run_cfg, data_root, args, device)
         print_results_table(results, point_lvr=point_lvr)
 
-        per_seed[str(seed)] = {"results": results, "point_lvr": point_lvr}
+        per_seed[str(seed)] = {"results": results, "point_lvr": point_lvr, "crossing_rate": crossing}
+        crossings.append(crossing)
         if point_lvr is not None:
             point_lvrs.append(point_lvr)
         name = "rtcqr_model.pt" if len(seeds) == 1 else f"rtcqr_model_seed{seed}.pt"
@@ -623,6 +657,7 @@ def main():
         # it did before --n-seeds existed.
         "results": runs[0],
         "point_lvr": per_seed[str(seeds[0])]["point_lvr"],
+        "crossing_rate": crossings[0],
         "torch_version": torch.__version__,
     }
     if len(seeds) > 1:
@@ -630,12 +665,11 @@ def main():
         print_aggregate_table(agg, point_lvrs=point_lvrs or None)
         payload["aggregate"] = agg
         payload["per_seed"] = per_seed
+        payload["crossing_rate_aggregate"] = {
+            split: _agg_scalar([c[split] for c in crossings]) for split in ("calib", "test")
+        }
         if point_lvrs:
-            payload["point_lvr_aggregate"] = {
-                "mean": float(np.mean(point_lvrs)),
-                "std": float(np.std(point_lvrs, ddof=1)) if len(point_lvrs) > 1 else 0.0,
-                "n": len(point_lvrs),
-            }
+            payload["point_lvr_aggregate"] = _agg_scalar(point_lvrs)
 
     with open(os.path.join(args.output_dir, "results.json"), "w") as f:
         json.dump(payload, f, indent=2)

@@ -12,6 +12,7 @@ LG 18650HG2 Li-ion battery dataset, following:
 
 - `rtcqr/model.py` — TCN backbone (4 residual blocks, 64 channels, kernel
   size 3, dropout 0.1) with a multi-quantile output head, eq. (14)-(15).
+  Two head parameterizations, see [below](#quantile-head-the-one-deviation-from-the-paper).
 - `rtcqr/losses.py` — risk-aligned composite quantile loss: pinball loss +
   quantile-crossing penalty + lower-tail regularizer, eq. (16)-(18).
 - `rtcqr/conformal.py` — violation-weighted, time-decayed nonconformity
@@ -263,6 +264,42 @@ calibration radius is set by an effective ~99 samples (see below), so
 LVR/AIW/ACE move from seed to seed on weight init alone; under
 `--split-mode segment` they move several-fold. Wall time scales with the
 seed count — each repeat retrains from scratch.
+
+### Quantile head: the one deviation from the paper
+
+The composite loss here is eq. (17) term for term. The model is not: the
+default head emits the lowest quantile plus a softplus'd (>= 0) increment
+per level, so `q[k] = q[k-1] + softplus(...)` cannot cross, whereas the
+paper uses |T| unconstrained outputs and *penalizes* crossing with
+`lambda_nc = 1.0`. That is why the crossing rate reported here is exactly
+0.0000 — it is structural, not something the model learned.
+
+The monotone head was adopted after measuring a ~14–15% crossing rate
+under `lambda_nc=1.0`. That measurement is not evidence any more: it was
+taken while the reconstructed SoC labels were still being driven into the
+`[0, 1]` clip by the truncated 40 °C `Cap_1C` section, before
+`--capacity-override` / `--min-soc-range` existed. Samples pinned at
+exactly 0.0 have a degenerate conditional distribution — every quantile's
+correct answer is the same number — so the fan collapses to zero width and
+the ordering is decided by numerical noise; and on exactly those samples
+the lower-tail regularizer pushes `q_{tau_l}` alone upward through its
+neighbours while `lambda_nc`'s hinge only pushes back after they have
+already crossed. With the labels corrected the clip pile-up is ~0%, so
+that mechanism is gone.
+
+`--unconstrained-head` runs the paper's version (unconstrained outputs,
+`lambda_nc=1.0`) so the question can be settled by measurement rather than
+inheritance:
+
+```bash
+python train.py --data-root /path/to/lg_hg2 --unconstrained-head
+```
+
+Every run prints and records a crossing rate (`crossing_rate` in
+`results.json`, `crossing_rate_aggregate` across seeds) for both calib and
+test. If it is near 0 under this flag, prefer the paper's head and the
+implementation matches it on every axis. If it is still high, keep the
+monotone head — and cite *that* number, not the stale one.
 
 ### How these numbers compare with the paper
 

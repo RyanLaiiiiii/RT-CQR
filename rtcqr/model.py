@@ -67,16 +67,34 @@ class TCNQuantileNet(nn.Module):
     Output: (batch, len(quantile_levels)), the estimated conditional
             quantiles of SoC at the *last* time step of the input window.
 
-    The head is parameterized to make quantile crossing structurally
-    impossible rather than merely discouraged: it outputs the lowest
-    quantile directly, plus a softplus'd (>=0) increment for each
-    subsequent quantile_levels entry, so q[k] = q[k-1] + softplus(raw[k]) is
-    non-decreasing by construction. `losses.quantile_crossing_penalty`
-    (lambda_nc in the composite loss) only *penalizes* crossing after the
-    fact, which observably wasn't enough on its own -- on the real LG HG2
-    data, once SoC genuinely spans the full [0,1] range (down to ~0 near
-    depletion, see rtcqr/data.py's per-condition capacity normalization),
-    the fitted quantile-crossing rate was ~14-15% despite lambda_nc=1.0.
+    Two head parameterizations, selected by `monotone_head`:
+
+    * `monotone_head=True` (default): the head emits the lowest quantile
+      directly plus a softplus'd (>=0) increment per subsequent level, so
+      q[k] = q[k-1] + softplus(raw[k]) is non-decreasing by construction and
+      crossing is arithmetically impossible. `losses.quantile_crossing_penalty`
+      is then identically zero and lambda_nc does nothing.
+
+    * `monotone_head=False`: the paper's own parameterization -- |T|
+      unconstrained outputs, with crossing only *penalized* after the fact
+      via lambda_nc (Table I sets it to 1.0).
+
+    Why both exist: the monotone head was introduced after a measured
+    ~14-15% crossing rate under lambda_nc=1.0, but that measurement was
+    taken while the reconstructed SoC labels were still being driven into
+    the [0, 1] clip by an under-measured capacity denominator (the truncated
+    40 degC Cap_1C section, fixed later by --capacity-override /
+    --min-soc-range). A stretch of samples pinned at exactly 0.0 gives a
+    degenerate conditional distribution -- every quantile's correct answer
+    is the same number -- so the fan collapses to zero width and which
+    output sits above which is decided by numerical noise. On top of that,
+    the lower-tail regularizer pushes q_{tau_l} alone upward toward
+    SoC_min on exactly those samples, straight through its neighbours. With
+    the labels since corrected the clip pile-up is ~0%, so that
+    justification no longer holds on current data and the paper's own head
+    may well suffice. Keep both until it has been re-measured: run
+    `train.py --unconstrained-head` and compare the reported crossing rate.
+
     `quantile_levels` must be sorted ascending, matching the paper's
     T = {tau_1 < ... < tau_|T|}.
     """
@@ -90,9 +108,11 @@ class TCNQuantileNet(nn.Module):
         kernel_size: int = 3,
         dropout: float = 0.1,
         initial_gap: float = 0.02,
+        monotone_head: bool = True,
     ):
         super().__init__()
         self.quantile_levels = list(quantile_levels)
+        self.monotone_head = monotone_head
 
         layers = []
         c_in = in_channels
@@ -134,6 +154,11 @@ class TCNQuantileNet(nn.Module):
     def _init_head(self, initial_gap: float) -> None:
         """Start the quantile fan narrow instead of ~5 SoC units wide.
 
+        Only applies to the monotone head: the unconstrained head emits
+        quantiles directly, so a default-initialised Linear already starts
+        them all near 0 rather than fanned out, and the softplus attenuation
+        described below does not arise.
+
         The increments are `softplus(raw)`, and a default-initialised Linear
         emits raw ~ 0, where softplus(0) = ln 2 ~ 0.693. With this dataset's 8
         quantile levels that stacks 7 increments into an initial 0.025-0.975
@@ -152,6 +177,8 @@ class TCNQuantileNet(nn.Module):
         (AIW 0.085 vs 0.096) with better coverage (0.943 vs 0.934), and hits
         the default init's 10-epoch interval width by epoch 5.
         """
+        if not self.monotone_head:
+            return
         with torch.no_grad():
             self.head.weight[1:].mul_(0.1)
             self.head.bias[1:].fill_(math.log(math.expm1(initial_gap)))
@@ -160,6 +187,8 @@ class TCNQuantileNet(nn.Module):
         h = self.tcn(x)          # (batch, channels, seq_len)
         h_last = h[:, :, -1]     # representation at the current (last) time step
         raw = self.head(h_last)  # (batch, num_quantiles)
+        if not self.monotone_head:
+            return raw
         base = raw[:, :1]
         increments = torch.nn.functional.softplus(raw[:, 1:])
         return torch.cat([base, base + torch.cumsum(increments, dim=1)], dim=1)

@@ -66,15 +66,22 @@ class RTCQRConfig:
     # started spanning the full [0,1] range (see rtcqr/data.py's capacity fix).
     patience: int = 20
 
+    # True: the head is monotone by construction (see model.TCNQuantileNet).
+    # False restores the paper's own parameterization -- |T| unconstrained
+    # outputs with crossing merely penalized -- which train.py --unconstrained-head
+    # selects, together with the paper's lambda_nc=1.0. Kept switchable
+    # because the monotone head was adopted in response to a crossing rate
+    # measured on SoC labels that were still clipping at 0; see
+    # model.TCNQuantileNet's docstring.
+    monotone_head: bool = True
+
     # --- Composite loss, eq. (17) ---
-    # 0.0, not the paper's 1.0: model.TCNQuantileNet's head emits
-    # q[k] = q[k-1] + softplus(.), so quantile crossing is structurally
-    # impossible and this penalty is *exactly* zero -- zero value and zero
-    # gradient -- for every input. Keeping it at 1.0 changes no number and
-    # only costs autograd nodes. Restore 1.0 if you swap in an unconstrained
-    # head, where it does real work (it was not enough on its own here: the
-    # crossing rate was still ~14-15% with lambda_nc=1.0 once SoC started
-    # spanning the full [0, 1] range).
+    # 0.0, not the paper's 1.0: with the default monotone head, quantile
+    # crossing is structurally impossible and this penalty is *exactly* zero
+    # -- zero value and zero gradient -- for every input, so keeping it at
+    # 1.0 changes no number and only costs autograd nodes.
+    # --unconstrained-head sets both monotone_head=False and lambda_nc=1.0,
+    # since the penalty is the only thing holding the quantiles in order there.
     lambda_nc: float = 0.0  # quantile-crossing penalty weight
     lambda_l: float = 0.1  # lower-tail regularization weight
 
