@@ -241,9 +241,9 @@ def evaluate(cfg: RTCQRConfig, model: TCNQuantileNet, splits, device, calibrator
                 calibrator = make_rtcqr_calibrator(cfg.soc_min, cfg.zeta, cfg.gamma, cfg.wl0, cfg.wl1,
                                                    cfg.wu, cfg.signed_score)
             elif name == "cqr":
-                calibrator = make_cqr_calibrator(cfg.soc_min, cfg.signed_score)
+                calibrator = make_cqr_calibrator(cfg.soc_min)
             elif name == "wcp":
-                calibrator = make_wcp_calibrator(cfg.soc_min, zeta=cfg.zeta, signed_score=cfg.signed_score)
+                calibrator = make_wcp_calibrator(cfg.soc_min, zeta=cfg.zeta)
             else:
                 raise ValueError(f"Unknown calibrator {name!r}")
 
@@ -295,10 +295,15 @@ def main():
     parser.add_argument("--resample-dt", type=float, default=None,
                          help="Uniform resampling interval in seconds applied to each reconstructed "
                               "measurement run before windowing (default 1.0). Pass 0 to disable resampling.")
-    parser.add_argument("--clipped-score", action="store_true",
-                         help="Take eq. (20)'s [.]_+ literally in the nonconformity score. Forces "
-                              "c_alpha >= 0, so calibration can only widen and becomes a no-op "
-                              "whenever the quantile model over-covers.")
+    parser.add_argument("--signed-score", action="store_true",
+                         help="Give RT-CQR the signed/standard-CQR residual instead of eq. (20)'s "
+                              "[.]_+, letting c_alpha go negative so calibration can tighten as well "
+                              "as widen. Not eq. (20); for comparison only. CQR/WCP always use the "
+                              "signed score, per Table I.")
+    parser.add_argument("--train-stride", type=int, default=None,
+                         help="Stride between training/validation windows (default 1). Consecutive "
+                              "stride-1 windows overlap by window_size-1 samples, so a larger stride "
+                              "cuts epoch cost with little information loss.")
     parser.add_argument("--calib-stride", type=int, default=None,
                          help="Stride between conformal calibration windows (default: window_size, i.e. "
                               "non-overlapping). Pass 1 to reproduce the fully overlapping calibration set.")
@@ -321,8 +326,10 @@ def main():
         cfg.rated_capacity_ah = args.rated_capacity
     if args.calib_stride is not None:
         cfg.calib_stride = args.calib_stride
-    if args.clipped_score:
-        cfg.signed_score = False
+    if args.signed_score:
+        cfg.signed_score = True
+    if args.train_stride is not None:
+        cfg.stride = args.train_stride
 
     set_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

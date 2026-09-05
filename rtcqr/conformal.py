@@ -3,14 +3,14 @@
 Nonconformity score, eq. (20)-(21):
     u_i = 1{SoC_i < SoC_min}
     w_l(u_i) = w_l^(0) + u_i * (w_l^(1) - w_l^(0)),   w_l^(1) >= w_l^(0) >= w_u >= 0
-    h_i = max( w_l(u_i) * (q_tl,i - SoC_i) , w_u * (SoC_i - q_tu,i) )
+    h_i = max( w_l(u_i) * [q_tl,i - SoC_i]_+ , w_u * [SoC_i - q_tu,i]_+ )
 
-The residuals keep their sign, as in standard CQR, so that c_alpha can be
-negative and calibration can tighten an over-covering interval. Taking
-eq. (20)'s [.]_+ literally makes calibration a pure widening operator and
-collapses RT-CQR, CQR and WCP onto the uncalibrated model whenever the
-quantile model over-covers -- see `nonconformity_scores`, and pass
-signed_score=False (train.py --clipped-score) for that literal reading.
+Both residuals are clipped by [.]_+, exactly as in eq. (20), so h_i >= 0 and
+therefore c_alpha >= 0: the calibration operator can only ever widen the
+preliminary interval. That is by design -- it repairs under-coverage -- but
+it means c_alpha is exactly 0 whenever the weighted calibration coverage
+already reaches 1 - alpha, and neither the omega weights nor gamma can
+change that (see `nonconformity_scores`).
 
 Time-decayed, violation-weighted empirical measure, eq. (22)-(24):
     gamma_{i,t} = zeta^{t-i} * (1 + gamma * u_i),   i <= t
@@ -47,32 +47,28 @@ def nonconformity_scores(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """eq. (20). Returns (scores, violation_indicator).
 
-    `signed_score` controls whether the two residuals keep their sign:
+    `signed_score=False` (the default, and what eq. (20) says) clips both
+    residuals:
 
-      signed (default):  h_i = max( w_l(u_i) * (q_tl,i - SoC_i),
-                                    w_u      * (SoC_i - q_tu,i) )
-      clipped:           h_i = max( w_l(u_i) * [q_tl,i - SoC_i]_+,
-                                    w_u      * [SoC_i - q_tu,i]_+ )
+        h_i = max( w_l(u_i) * [q_tl,i - SoC_i]_+ , w_u * [SoC_i - q_tu,i]_+ )
 
-    The signed form is standard CQR (Romano et al., 2019) generalized with
-    the asymmetric weights: for a point comfortably inside the interval
-    both residuals are negative, the score is the (negative) slack, and
-    c_alpha can come out negative so the calibrated interval *tightens*.
+    A calibration point *inside* the interval then has both terms equal to
+    zero, so h_i = 0 for any omega. Since c_alpha is the weighted
+    (1 - alpha)-quantile of {h_i}, it is exactly 0 whenever at least
+    (1 - alpha) of the weight sits on covered samples -- i.e. whenever the
+    model already achieves nominal coverage on the calibration set. Scaling
+    zeros by omega leaves zeros, and gamma only redistributes weight among
+    them, so neither knob can lift c_alpha off zero; only the base model
+    under-covering can. Measured: c_alpha stays 0.000000 for calibration
+    coverage 0.99 / 0.96 / 0.92 / 0.90 and becomes 0.013 / 0.028 / 0.047 at
+    0.86 / 0.80 / 0.70.
 
-    The clipped form -- the literal reading of eq. (20)'s [.]_+ notation --
-    cannot do that. Its score is >= 0, hence c_alpha >= 0, hence
-    calibration is a pure widening operator that can only ever fix
-    *under*-coverage. When the quantile model over-covers, every
-    calibrator returns c_alpha = 0 and RT-CQR, CQR and WCP all collapse
-    onto the uncalibrated model, byte for byte. That is not hypothetical:
-    measured on this dataset the model covered 97.6% of the calibration
-    set at 90% nominal, so all four rows of the results table came out
-    identical, and switching to the signed score cut AIW from 0.043 to
-    0.028 and ACE from 0.088 to 0.028.
-
-    It also matters for the baselines: `make_cqr_calibrator` documents
-    itself as "standard CQR", which is the signed score by definition.
-    Under clipping it is not standard CQR at all.
+    `signed_score=True` drops the clip, giving the standard CQR residual
+    (Romano et al., 2019) generalized with the asymmetric weights. An
+    interior point then scores its negative slack, c_alpha can go negative,
+    and calibration can tighten an over-covering interval as well as widen
+    an under-covering one. Table I assigns this signed score to the CQR and
+    WCP baselines ("standard CQR score"); RT-CQR uses the clipped eq. (20).
     """
     violation = (soc_true < soc_min).astype(np.float64)
     wl = lower_tail_weight(violation, wl0, wl1)

@@ -13,8 +13,12 @@ from typing import List, Optional
 @dataclass
 class RTCQRConfig:
     # --- Data / windowing ---
-    window_size: int = 100
-    stride: int = 1
+    # Table I fixes the backbone at 4 residual blocks / kernel 3, whose causal
+    # receptive field is 1 + 2*(k-1)*sum(dilations) = 61 steps. A longer window
+    # is literally invisible to the head (verified by gradient: at window 100
+    # only steps 39..99 have non-zero gradient), so the window matches the field.
+    window_size: int = 61
+    stride: int = 1  # between training/validation windows
     resample_dt_s: Optional[float] = 1.0  # uniform resampling interval (s) applied before windowing
     # None = measure the usable 1C capacity at each test temperature from
     # that temperature's own Cap_1C/C20DisCh section. A fixed nameplate
@@ -65,11 +69,14 @@ class RTCQRConfig:
     wl1: float = 3.0  # w_l^(1): lower-tail weight on violation samples (wl1 >= wl0 >= wu >= 0)
     wu: float = 1.0  # w_u: upper-tail nonconformity weight
     calib_max_history: int = 2000  # cap on samples kept for online recalibration (efficiency only)
-    # Keep the sign of the two residuals in the nonconformity score, so a
-    # calibrated interval can tighten as well as widen. False takes eq. (20)'s
-    # [.]_+ literally, which forces c_alpha >= 0 and makes every calibrator a
-    # no-op when the model over-covers. See rtcqr.conformal.nonconformity_scores.
-    signed_score: bool = True
+    # Applies to RT-CQR only; CQR/WCP always use Table I's standard CQR score.
+    # False = eq. (20) exactly: both residuals clipped by [.]_+, so eta_i >= 0
+    # and c_alpha >= 0. Calibration is then a widening-only operator, which is
+    # the paper's design: it corrects under-coverage, and gamma (not the omega
+    # weights) is what lifts c_alpha off zero by re-weighting violation
+    # samples. True switches to the signed/standard-CQR residual, which can
+    # also tighten; kept for comparison only, it is not eq. (20).
+    signed_score: bool = False
 
     seed: int = 42
 

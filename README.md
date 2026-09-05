@@ -261,32 +261,43 @@ miscalibrated intervals (ACE far above 0, and a 95% PI narrower than the
 long, continuous multi-profile sweeps, where 15% of one such sweep still
 spans a representative chunk of the SoC trajectory.
 
-### The nonconformity score keeps its sign
+### Calibration is a widening-only operator (eq. 20)
 
-`h_i = max( w_l(u_i) * (q_tl,i - SoC_i), w_u * (SoC_i - q_tu,i) )` -- the
-two residuals are *not* clipped at zero, which is what standard CQR does
-and what lets `c_alpha` come out negative so calibration can **tighten**
-an over-covering interval, not only widen an under-covering one.
+Eq. (20) clips both residuals,
+`eta_i = max( w_l(u_i) * [q_l - SoC]_+ , w_u * [SoC - q_u]_+ )`, so
+`eta_i >= 0` and hence `c_alpha >= 0`. Calibration can only widen the
+preliminary interval, never tighten it. It repairs under-coverage; there
+is nothing for it to do when the quantile model already over-covers.
 
-Taking eq. (20)'s `[.]_+` literally forces `h_i >= 0`, hence
-`c_alpha >= 0`. Calibration then becomes a pure widening operator, and
-whenever the quantile model over-covers, every calibrator returns
-`c_alpha = 0` and RT-CQR, CQR and WCP collapse onto the uncalibrated
-model. Measured here (25 degC subset, 12 epochs, 84 calibration windows):
-the model covered 97.6% of the calibration set at 90% nominal, so all
-four rows came out byte-identical.
+A consequence worth knowing before debugging a run where all methods
+report identical numbers: **`c_alpha` is exactly 0 whenever the weighted
+calibration coverage already reaches `1 - alpha`**, and neither the omega
+weights nor gamma can change that. A covered calibration point has both
+`[.]_+` terms equal to zero, so `eta_i = 0` for any omega; scaling zeros
+leaves zeros, and gamma only redistributes weight among them. Measured
+with `wl0/wl1/wu = 1.5/3.0/1.0`, `gamma = 1`:
 
-| 90% PI | AIW (clipped) | AIW (signed) | ACE (clipped) | ACE (signed) |
-|---|---|---|---|---|
-| uncalibrated | 0.043 | 0.043 | 0.088 | 0.088 |
-| RT-CQR | 0.043 | **0.028** | 0.088 | **0.028** |
-| CQR | 0.043 | 0.034 | 0.088 | 0.061 |
-| WCP | 0.043 | 0.037 | 0.088 | 0.075 |
+| calibration coverage | 0.99 | 0.96 | 0.92 | 0.90 | 0.86 | 0.80 | 0.70 |
+|---|---|---|---|---|---|---|---|
+| `c_alpha` (90% PI) | 0 | 0 | 0 | 0 | 0.013 | 0.028 | 0.047 |
 
-It also matters for the baselines: `make_cqr_calibrator` is documented as
-"standard CQR", and standard CQR is signed by definition -- under
-clipping it is not standard CQR at all. Pass `--clipped-score` to get the
-literal reading back.
+So if RT-CQR, CQR and WCP all come out equal to the uncalibrated model,
+the thing to fix is the quantile model's coverage (usually undertraining),
+not the score or the weights. `--signed-score` swaps in the standard CQR
+residual, which *can* tighten -- useful for diagnosis, but it is not
+eq. (20).
+
+Per Table I the three methods do not share one score: CQR and WCP use the
+"standard CQR score" (signed), and only RT-CQR uses eq. (20). `baselines.py`
+encodes that.
+
+### Backbone size follows from Table I
+
+Table I fixes the TCN at four residual blocks, kernel size 3, so the causal
+receptive field is `1 + 2*(k-1)*sum(dilations) = 1 + 2*2*(1+2+4+8) = 61`
+steps. `window_size` therefore defaults to 61: at the previous default of
+100, the first 39 steps of every window had exactly zero gradient and were
+invisible to the head.
 
 ### Reproducing the ablation study (Table IV)
 
@@ -308,8 +319,9 @@ python train.py --data-root /path/to/lg_hg2 --calibrators cqr --output-dir outpu
 - `--current-sign {1,-1}` — coulomb-counting sign convention (see above).
 - `--rated-capacity AH` — force one coulomb-counting capacity for every
   temperature instead of measuring each temperature's own (see above).
-- `--clipped-score` — take eq. (20)'s `[.]_+` literally (see above);
-  calibration can then only widen, never tighten.
+- `--signed-score` — give RT-CQR the standard CQR residual instead of
+  eq. (20)'s `[.]_+` (see above); diagnostic only.
+- `--train-stride N` — stride between training/validation windows.
 - `--calib-stride N` — stride between conformal calibration windows
   (default: `window_size`, i.e. non-overlapping). At stride 1 the
   calibration set is 99%-overlapping windows, so `zeta^lag` decays across
