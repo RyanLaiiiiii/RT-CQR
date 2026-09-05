@@ -35,6 +35,7 @@ from rtcqr.data import (
     Standardizer,
     _DEFAULT_INCLUDE_PATTERNS,
     chronological_split,
+    drivecycle_split,
     load_lg_hg2_dataframe,
     make_windows,
     segment_split,
@@ -67,7 +68,11 @@ def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include
 
     print(f"[rtcqr.train] Loaded {len(files)} windowing segment(s) from {data_root}")
 
-    if split_mode == "segment":
+    if split_mode == "drivecycle":
+        train_frames, val_model_frames, calib_frames, test_frames = drivecycle_split(
+            files, cfg.val_frac, cfg.val_calib_fraction, seed=cfg.seed
+        )
+    elif split_mode == "segment":
         # Most segments in this dataset are short, single charge/discharge
         # cycles (SoC ~1.0 -> some low point over a few hours). Slicing each
         # one chronologically would systematically give train the high-SoC
@@ -282,8 +287,9 @@ def main():
     parser.add_argument("--exclude-measurement-ids", nargs="+", default=None,
                          help="Drop entire Measurement IDs from the windowing segments, "
                               "e.g. --exclude-measurement-ids 590 556")
-    parser.add_argument("--split-mode", choices=["segment", "chronological"], default="segment",
-                         help="'segment' (default) randomly assigns whole segments to train/val/calib/test, "
+    parser.add_argument("--split-mode", choices=["drivecycle", "segment", "chronological"], default="drivecycle",
+                         help="'drivecycle' (default) holds out every LA92/UDDS/US06 segment as test, per the "
+                              "protocol of [6]. 'segment' randomly assigns whole segments to train/val/calib/test, "
                               "appropriate when most segments are short single charge/discharge cycles. "
                               "'chronological' slices each segment by time, appropriate only when segments are "
                               "few, long, continuous multi-profile sweeps.")

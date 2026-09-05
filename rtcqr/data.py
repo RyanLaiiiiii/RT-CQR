@@ -737,6 +737,60 @@ def segment_split(
     return frames(train_idx), frames(val_idx), frames(calib_idx), frames(test_idx)
 
 
+# Drive-cycle profiles held out as the test set by the protocol of [6]
+# (Hannan et al., Sci. Rep. 11:19541, 2021), which the RT-CQR paper follows.
+# Its Figs. 1-3 plot exactly LA92 / UDDS / US06 as test cycles at each of the
+# six ambient temperatures; HWFET and the random Mixed cycles form train/val.
+_REF6_TEST_PATTERNS = ["la92", "udds", "us06"]
+
+
+def drivecycle_split(
+    files: Sequence[BatteryFile],
+    val_frac: float,
+    val_calib_fraction: float,
+    seed: int = 42,
+    test_patterns: Sequence[str] = _REF6_TEST_PATTERNS,
+) -> Tuple[List[pd.DataFrame], List[pd.DataFrame], List[pd.DataFrame], List[pd.DataFrame]]:
+    """Split by drive-cycle *profile*, per the protocol of [6].
+
+    Every LA92, UDDS and US06 segment -- at every temperature -- becomes
+    test; HWFET and the random Mixed cycles become train/val/calib. The
+    model is therefore evaluated on profiles it has never seen, at all six
+    ambient temperatures, which is what "cross-condition evaluation" means.
+
+    `segment_split` instead assigns whole segments at random, so a Mixed4
+    run can train while Mixed5 from the same measurement tests. That is a
+    materially easier problem: it more than halves the interval width the
+    model needs (AIW 0.065 vs. the paper's 0.145 at 90%).
+    """
+    test, pool = [], []
+    for bf in files:
+        (test if _matches_any(bf.path, test_patterns) else pool).append(bf)
+    if not test:
+        raise RuntimeError(
+            f"No segments matched the held-out drive cycles {list(test_patterns)}. "
+            "Run `python -m rtcqr.data inspect <root>` to see the section names found."
+        )
+    if len(pool) < 3:
+        raise RuntimeError(f"Only {len(pool)} non-test segment(s); need at least 3 for train/val/calib.")
+
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(pool))
+    n_val_total = max(2, int(round(len(pool) * val_frac)))
+    n_val = max(1, int(round(n_val_total * (1.0 - val_calib_fraction))))
+    n_calib = max(1, n_val_total - n_val)
+
+    val_idx = order[:n_val]
+    calib_idx = order[n_val:n_val + n_calib]
+    train_idx = order[n_val + n_calib:]
+
+    print(f"[rtcqr.data] drive-cycle split: test = {len(test)} segment(s) matching "
+          f"{list(test_patterns)}; train/val/calib = {len(train_idx)}/{len(val_idx)}/{len(calib_idx)} "
+          f"from the remaining {len(pool)}")
+    frames = lambda idx: [pool[i].frame for i in idx]
+    return frames(train_idx), frames(val_idx), frames(calib_idx), [bf.frame for bf in test]
+
+
 def make_windows(
     frames: Sequence[pd.DataFrame], window_size: int, stride: int = 1
 ) -> Tuple[np.ndarray, np.ndarray]:
