@@ -261,6 +261,33 @@ miscalibrated intervals (ACE far above 0, and a 95% PI narrower than the
 long, continuous multi-profile sweeps, where 15% of one such sweep still
 spans a representative chunk of the SoC trajectory.
 
+### The nonconformity score keeps its sign
+
+`h_i = max( w_l(u_i) * (q_tl,i - SoC_i), w_u * (SoC_i - q_tu,i) )` -- the
+two residuals are *not* clipped at zero, which is what standard CQR does
+and what lets `c_alpha` come out negative so calibration can **tighten**
+an over-covering interval, not only widen an under-covering one.
+
+Taking eq. (20)'s `[.]_+` literally forces `h_i >= 0`, hence
+`c_alpha >= 0`. Calibration then becomes a pure widening operator, and
+whenever the quantile model over-covers, every calibrator returns
+`c_alpha = 0` and RT-CQR, CQR and WCP collapse onto the uncalibrated
+model. Measured here (25 degC subset, 12 epochs, 84 calibration windows):
+the model covered 97.6% of the calibration set at 90% nominal, so all
+four rows came out byte-identical.
+
+| 90% PI | AIW (clipped) | AIW (signed) | ACE (clipped) | ACE (signed) |
+|---|---|---|---|---|
+| uncalibrated | 0.043 | 0.043 | 0.088 | 0.088 |
+| RT-CQR | 0.043 | **0.028** | 0.088 | **0.028** |
+| CQR | 0.043 | 0.034 | 0.088 | 0.061 |
+| WCP | 0.043 | 0.037 | 0.088 | 0.075 |
+
+It also matters for the baselines: `make_cqr_calibrator` is documented as
+"standard CQR", and standard CQR is signed by definition -- under
+clipping it is not standard CQR at all. Pass `--clipped-score` to get the
+literal reading back.
+
 ### Reproducing the ablation study (Table IV)
 
 ```bash
@@ -281,6 +308,8 @@ python train.py --data-root /path/to/lg_hg2 --calibrators cqr --output-dir outpu
 - `--current-sign {1,-1}` — coulomb-counting sign convention (see above).
 - `--rated-capacity AH` — force one coulomb-counting capacity for every
   temperature instead of measuring each temperature's own (see above).
+- `--clipped-score` — take eq. (20)'s `[.]_+` literally (see above);
+  calibration can then only widen, never tighten.
 - `--calib-stride N` — stride between conformal calibration windows
   (default: `window_size`, i.e. non-overlapping). At stride 1 the
   calibration set is 99%-overlapping windows, so `zeta^lag` decays across

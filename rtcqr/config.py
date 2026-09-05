@@ -65,6 +65,11 @@ class RTCQRConfig:
     wl1: float = 3.0  # w_l^(1): lower-tail weight on violation samples (wl1 >= wl0 >= wu >= 0)
     wu: float = 1.0  # w_u: upper-tail nonconformity weight
     calib_max_history: int = 2000  # cap on samples kept for online recalibration (efficiency only)
+    # Keep the sign of the two residuals in the nonconformity score, so a
+    # calibrated interval can tighten as well as widen. False takes eq. (20)'s
+    # [.]_+ literally, which forces c_alpha >= 0 and makes every calibrator a
+    # no-op when the model over-covers. See rtcqr.conformal.nonconformity_scores.
+    signed_score: bool = True
 
     seed: int = 42
 
