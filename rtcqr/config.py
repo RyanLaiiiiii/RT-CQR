@@ -36,12 +36,17 @@ class RTCQRConfig:
     # nominal miscoverage alpha for each evaluated PI (90% and 95%)
     pi_alphas: List[float] = field(default_factory=lambda: [0.10, 0.05])
     val_calib_fraction: float = 0.5  # fraction of the validation split reserved for conformal calibration
-    # Stride between calibration windows. None = window_size, i.e. make them
-    # non-overlapping. At stride 1 the calibration set is 99%-overlapping
-    # windows, so zeta^lag decays across redundant copies of the same
-    # instant: on this dataset that left an effective sample size of 99 out
-    # of 28,375 (~100 s of one segment). Test/val stay at stride 1.
+    # Stride between calibration windows. None = choose the largest stride, up
+    # to window_size, that still yields `calib_min_windows` samples.
+    #
+    # Two failure modes to stay between. Stride 1 makes the calibration set
+    # 99%-overlapping windows, so zeta^lag decays across redundant copies of
+    # the same instant -- 95% of the weight then lands inside ~2.5 minutes of
+    # one segment. Non-overlapping (stride = window_size) is clean but, at
+    # window_size 341, leaves only 66 samples, whose weighted quantile can
+    # resolve no better than 1/66 = 0.015 -- too coarse for alpha = 0.05.
     calib_stride: Optional[int] = None
+    calib_min_windows: int = 1000
     train_frac: float = 0.70
     val_frac: float = 0.15
     # test_frac is implicitly 1 - train_frac - val_frac; under the default

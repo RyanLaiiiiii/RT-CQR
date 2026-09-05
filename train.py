@@ -52,6 +52,25 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
+def _resolve_calib_stride(calib_frames, cfg: RTCQRConfig) -> int:
+    """Largest stride (at most window_size, i.e. non-overlapping) that still
+    yields cfg.calib_min_windows calibration samples.
+
+    c_alpha is a weighted empirical quantile of the calibration scores, so
+    its resolution is bounded by 1/N_cal: 66 samples cannot place a 0.05
+    tail to better than 0.015. Overlapping the windows is the lesser evil,
+    but only as far as the sample count actually requires.
+    """
+    usable = sum(max(0, len(df) - cfg.window_size + 1) for df in calib_frames)
+    if usable <= 0:
+        return cfg.window_size
+    stride = max(1, min(cfg.window_size, usable // max(1, cfg.calib_min_windows)))
+    print(f"[rtcqr.train] calibration stride {stride} "
+          f"(target >={cfg.calib_min_windows} windows from {usable} usable positions; "
+          f"non-overlapping would be {cfg.window_size})")
+    return stride
+
+
 def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include_all: bool = False,
                    exclude_measurement_ids: Optional[List[str]] = None, split_mode: str = "segment"):
     include_patterns = None if include_all else _DEFAULT_INCLUDE_PATTERNS
@@ -96,7 +115,8 @@ def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include
 
     X_train, y_train = make_windows(train_frames, cfg.window_size, cfg.stride)
     X_val, y_val = make_windows(val_model_frames, cfg.window_size, cfg.stride)
-    X_calib, y_calib = make_windows(calib_frames, cfg.window_size, cfg.calib_stride or cfg.window_size)
+    calib_stride = cfg.calib_stride or _resolve_calib_stride(calib_frames, cfg)
+    X_calib, y_calib = make_windows(calib_frames, cfg.window_size, calib_stride)
     X_test, y_test = make_windows(test_frames, cfg.window_size, stride=1)
 
     scaler = Standardizer(cfg.normalize).fit(X_train)
@@ -324,6 +344,9 @@ def main():
                          help="Stride between training/validation windows (default 1). Consecutive "
                               "stride-1 windows overlap by window_size-1 samples, so a larger stride "
                               "cuts epoch cost with little information loss.")
+    parser.add_argument("--calib-min-windows", type=int, default=None,
+                         help="Target minimum number of calibration windows; the stride is chosen to "
+                              "reach it (default 1000). c_alpha resolves no finer than 1/N_cal.")
     parser.add_argument("--calib-stride", type=int, default=None,
                          help="Stride between conformal calibration windows (default: window_size, i.e. "
                               "non-overlapping). Pass 1 to reproduce the fully overlapping calibration set.")
@@ -346,6 +369,8 @@ def main():
         cfg.rated_capacity_ah = args.rated_capacity
     if args.calib_stride is not None:
         cfg.calib_stride = args.calib_stride
+    if args.calib_min_windows is not None:
+        cfg.calib_min_windows = args.calib_min_windows
     if args.signed_score:
         cfg.signed_score = True
     if args.train_stride is not None:
