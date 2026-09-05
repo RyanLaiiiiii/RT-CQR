@@ -16,9 +16,11 @@ calibration. Pass --no-ltr to reproduce the "RT-CQR w/o LTR" ablation row
 (Table IV); the "w/o VW-TAC" row is the RT-CQR model with --calibrators cqr.
 
 The default --split-mode fixed follows the paper's protocol: a
-deterministic partition by drive cycle (train Mixed1-8 + UDDS, validate
-LA92, test US06 + HWFET, at -20/-10/0/10/25 degC) with calibration held
-out from validation. --n-seeds repeats the whole pass and reports
+deterministic partition by drive cycle (test on US06 + LA92 + UDDS, the
+three [6] names as its LG test set; train on the Mixed cycles and validate
+on HWFET) over all six ambient conditions -20/-10/0/10/25/40 degC, with
+calibration held out from validation. 40 degC needs --capacity-override
+40:2.75 on this dataset. --n-seeds repeats the whole pass and reports
 mean +/- std, since a single run's numbers carry the noise of whatever
 landed in the calibration buffer.
 """
@@ -98,6 +100,24 @@ def parse_capacity_overrides(values) -> Dict[float, float]:
             out[temp] = cap
     return out
 
+
+
+def parse_fixed_sections(values) -> Optional[Dict[str, tuple]]:
+    """Parse ``role=pat,pat`` tokens into {role: (pattern, ...)}."""
+    if not values:
+        return None
+    out: Dict[str, tuple] = {}
+    for token in values:
+        role, _, pats = str(token).partition("=")
+        role = role.strip().lower()
+        if role not in ("train", "val", "test") or not pats.strip():
+            raise argparse.ArgumentTypeError(
+                f"--fixed-sections expects train=/val=/test= followed by cycle patterns, got {token!r}")
+        out[role] = tuple(p.strip().lower() for p in pats.split(",") if p.strip())
+    missing = {"train", "val", "test"} - set(out)
+    if missing:
+        raise argparse.ArgumentTypeError(f"--fixed-sections is missing role(s) {sorted(missing)}")
+    return out
 
 
 def _report_split_conditions(train, val, calib, test) -> None:
@@ -208,7 +228,8 @@ def _warn_if_calib_unrepresentative(calib_frames, test_frames) -> None:
 
 def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include_all: bool = False,
                    exclude_measurement_ids: Optional[List[str]] = None, split_mode: str = "fixed",
-                   fixed_conditions: Optional[List[float]] = None):
+                   fixed_conditions: Optional[List[float]] = None,
+                   fixed_sections: Optional[Dict[str, tuple]] = None):
     include_patterns = None if include_all else _DEFAULT_INCLUDE_PATTERNS
     files = load_lg_hg2_dataframe(
         data_root, rated_capacity_ah=cfg.rated_capacity_ah, current_sign=current_sign,
@@ -229,7 +250,8 @@ def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include
         # The paper's protocol (Sec. IV.A/IV.B): a deterministic partition by
         # drive cycle, with calibration held out from the validation set.
         train_frames, val_frames, test_frames = fixed_split(
-            files, conditions=fixed_conditions if fixed_conditions is not None else PAPER_FIXED_CONDITIONS)
+            files, sections=fixed_sections,
+            conditions=fixed_conditions if fixed_conditions is not None else PAPER_FIXED_CONDITIONS)
         val_model_frames, calib_frames = _carve_calibration(
             val_frames, cfg.val_calib_fraction, cfg.calib_blocks)
     elif split_mode == "segment":
@@ -529,7 +551,8 @@ def run_once(cfg: RTCQRConfig, data_root: str, args,
     set_seed(cfg.seed)
     splits = build_windows(cfg, data_root, current_sign=args.current_sign, include_all=args.include_all,
                            exclude_measurement_ids=args.exclude_measurement_ids, split_mode=args.split_mode,
-                           fixed_conditions=args.fixed_conditions)
+                           fixed_conditions=args.fixed_conditions,
+                           fixed_sections=parse_fixed_sections(args.fixed_sections))
 
     t0 = time.time()
     model = train_model(cfg, splits, device, num_workers=args.num_workers)
@@ -558,16 +581,23 @@ def main():
                          help="Drop entire Measurement IDs from the windowing segments, "
                               "e.g. --exclude-measurement-ids 590 556")
     parser.add_argument("--split-mode", choices=["fixed", "segment", "chronological"], default="fixed",
-                         help="'fixed' (default) reproduces the paper's deterministic partition: train on "
-                              "Mixed1-8 + UDDS, validate on LA92, test on US06 + HWFET, over -20/-10/0/10/25 "
-                              "degC, with calibration held out from validation. 'segment' randomly assigns "
+                         help="'fixed' (default) reproduces the paper's deterministic partition: test on "
+                              "US06 + LA92 + UDDS, train on the Mixed cycles, validate on HWFET, over all six "
+                              "conditions -20/-10/0/10/25/40 degC, with calibration held out from validation "
+                              "(40 degC needs --capacity-override 40:2.75 here). 'segment' randomly assigns "
                               "whole segments to train/val/calib/test -- useful for robustness checks, but its "
                               "results move by 2-4x with the seed on this dataset. 'chronological' slices each "
                               "segment by time, appropriate only for few, long, continuous sweeps.")
     parser.add_argument("--fixed-conditions", type=float, nargs="+", default=None, metavar="DEGC",
-                         help="Ambient conditions to keep under --split-mode fixed (default "
-                              "-20 -10 0 10 25, the protocol's five). Pass e.g. --fixed-conditions -20 -10 0 "
-                              "10 25 40 to include 40 degC as well.")
+                         help="Ambient conditions to keep under --split-mode fixed (default -20 -10 0 10 "
+                              "25 40, the protocol's six). Note 40 degC needs --capacity-override 40:2.75 "
+                              "on this dataset, whose 40 degC Cap_1C section is truncated.")
+    parser.add_argument("--fixed-sections", nargs="+", default=None, metavar="ROLE=PAT,PAT",
+                         help="Override which drive cycles fill each role under --split-mode fixed, e.g. "
+                              "--fixed-sections train=mixed,hwfet val=la92 test=us06,udds. Defaults to "
+                              "train=mixed val=hwfet test=us06,la92,udds. The test role is what [6] states "
+                              "outright; its train/validation division lives in a supplementary table not "
+                              "in the article, so override this if you obtain it.")
     parser.add_argument("--calibrators", nargs="+", default=["rtcqr", "cqr", "wcp"], choices=["rtcqr", "cqr", "wcp"])
     parser.add_argument("--no-ltr", action="store_true", help="Ablation: disable the lower-tail regularizer (lambda_l=0).")
     parser.add_argument("--unconstrained-head", action="store_true",

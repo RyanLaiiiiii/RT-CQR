@@ -986,22 +986,33 @@ def segment_split(
 # The fixed partition the paper evaluates on. Sec. IV.A states the data are
 # split "following the protocol in [6]" (Hannan et al., Sci. Rep. 2021) and
 # Sec. IV.B that "all methods follow an identical *fixed* partitioning" --
-# i.e. a deterministic, cycle-name-based split, not a random one. For this
-# dataset that protocol trains on the eight Mixed cycles plus UDDS,
-# validates on LA92, and tests on US06 and HWFET, over the five ambient
-# conditions -20/-10/0/10/25 degC.
+# i.e. a deterministic, cycle-name-based split, not a random one.
 #
-# Two consequences worth knowing before comparing against Table II:
-#   * 40 degC is not part of the protocol, so the truncated 40 degC Cap_1C
-#     section (and its --capacity-override) drops out of the picture here.
-#   * With no random assignment, seed-to-seed variation reflects weight init
-#     and batch order only, not which segments landed in which split.
+# What [6] states directly:
+#   * "The estimation plot on the test dataset consisting of US06, LA92 and
+#     UDDS drive cycle" -- so those three are the LG cell's TEST set.
+#   * Its Figs. 2-3 plot those same three cycles at 10, 25, 40, 0, -10 and
+#     -20 degC, and its Methods say "ambient temperatures ranging from -20
+#     to 40 degC": all six conditions, 40 degC included.
+#   * HWFET appears only in its Fig. 4, which is the *Panasonic* cell's test
+#     set -- not the LG protocol.
+#
+# What it does not state here: the exact train/validation division, which it
+# defers to a Supplementary Table 3 not included in the article PDF. What is
+# left after removing the test cycles is the eight Mixed cycles and HWFET,
+# and the assignment below (train on the Mixed cycles, validate on HWFET) is
+# this implementation's choice among those, not something [6] specifies.
+# Override it with --fixed-sections if you obtain that table.
+#
+# Because 40 degC is in the protocol, this dataset's truncated 40 degC
+# Cap_1C section is back in play: pass --capacity-override 40:2.75 (see the
+# README) or its SoC labels bottom out early.
 PAPER_FIXED_SECTIONS = {
-    "train": ("mixed", "udds"),
-    "val": ("la92",),
-    "test": ("us06", "hwfet"),
+    "train": ("mixed",),
+    "val": ("hwfet",),
+    "test": ("us06", "la92", "udds"),
 }
-PAPER_FIXED_CONDITIONS = (-20.0, -10.0, 0.0, 10.0, 25.0)
+PAPER_FIXED_CONDITIONS = (-20.0, -10.0, 0.0, 10.0, 25.0, 40.0)
 
 
 def fixed_split(
@@ -1031,8 +1042,10 @@ def fixed_split(
 
     buckets: Dict[str, List[BatteryFile]] = {role: [] for role in sections}
     unassigned: List[str] = []
+    excluded_conditions: Dict[Optional[float], int] = defaultdict(int)
     for bf in files:
         if keep_conditions is not None and bf.condition not in keep_conditions:
+            excluded_conditions[bf.condition] += 1
             continue
         role = next((r for r, pats in sections.items() if _matches_any(bf.test_section, pats)), None)
         if role is None:
@@ -1040,6 +1053,12 @@ def fixed_split(
         else:
             buckets[role].append(bf)
 
+    if excluded_conditions:
+        summary = ", ".join(f"{c} degC: {n}" for c, n in
+                            sorted(excluded_conditions.items(), key=lambda kv: (kv[0] is None, kv[0])))
+        print(f"[rtcqr.data] fixed split: dropped {sum(excluded_conditions.values())} segment(s) at "
+              f"condition(s) outside the protocol ({summary}). Keeping "
+              f"{sorted(keep_conditions)} degC; pass --fixed-conditions to change that.")
     if unassigned:
         print(f"[rtcqr.data] fixed split: dropped {len(unassigned)} segment(s) whose section matches no "
               f"role: {sorted(set(unassigned))}")

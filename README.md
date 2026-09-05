@@ -335,16 +335,33 @@ splits the data "following the protocol in [6]" and Sec. IV.B states that
 deterministic, cycle-name-based split rather than a random one. For this
 dataset that protocol is:
 
-| split | drive cycles |
-|---|---|
-| train | `Mixed1`–`Mixed8`, `UDDS` |
-| val | `LA92` |
-| test | `US06`, `HWFET` |
+| split | drive cycles | source |
+|---|---|---|
+| train | `Mixed1`–`Mixed8` | this repo's choice |
+| val | `HWFET` | this repo's choice |
+| test | `US06`, `LA92`, `UDDS` | **stated by [6]** |
 
-over the five ambient conditions −20/−10/0/10/25 °C (`--fixed-conditions`
-to change them). Note 40 °C is outside the protocol, so this dataset's
-truncated 40 °C `Cap_1C` section — and the `--capacity-override 40:2.75`
-that works around it — drops out of the picture entirely under this mode.
+over all six ambient conditions −20/−10/0/10/25/**40** °C
+(`--fixed-conditions` to change them).
+
+The test role is not a guess: [6] writes "the estimation plot on the test
+dataset consisting of US06, LA92 and UDDS drive cycle", and plots exactly
+those three at 10, 25, 40, 0, −10 and −20 °C — all six conditions, with
+its Methods giving "ambient temperatures ranging from −20 to 40 °C".
+HWFET appears only in its Fig. 4, which is the *Panasonic* cell's test
+set, not the LG protocol.
+
+What [6] does **not** give in the article is how the remaining cycles
+divide between train and validation — it defers that to a Supplementary
+Table 3 the PDF does not include. Everything but the three test cycles is
+the eight `Mixed` cycles plus `HWFET`, and training on the former while
+validating on the latter is this implementation's choice among those.
+Override it with `--fixed-sections train=... val=... test=...` if you
+obtain that table.
+
+Because 40 °C is inside the protocol, this dataset's truncated 40 °C
+`Cap_1C` section is back in play: pass `--capacity-override 40:2.75`, or
+that condition's SoC labels bottom out early.
 
 Calibration is carved from validation, per Sec. IV.B ("CQR, WCP, and
 RT-CQR are calibrated on a common subset held out from the validation
