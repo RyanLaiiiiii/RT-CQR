@@ -16,7 +16,11 @@ class RTCQRConfig:
     window_size: int = 100
     stride: int = 1
     resample_dt_s: Optional[float] = 1.0  # uniform resampling interval (s) applied before windowing
-    rated_capacity_ah: float = 3.0
+    # None = measure the usable 1C capacity at each test temperature from
+    # that temperature's own Cap_1C/C20DisCh section. A fixed nameplate
+    # 3.0 Ah labels an empty cell (2.8 V cut-off) as SoC 0.12 at 25 degC
+    # and SoC 0.44 at -20 degC; see rtcqr.data._measure_reference_capacities.
+    rated_capacity_ah: Optional[float] = None
     soc_min: float = 0.10
     # tau in eq. (14)/(17): T = {0.025, 0.05, 0.10, 0.15, 0.85, 0.90, 0.95, 0.975}
     quantile_levels: List[float] = field(
@@ -25,9 +29,16 @@ class RTCQRConfig:
     # nominal miscoverage alpha for each evaluated PI (90% and 95%)
     pi_alphas: List[float] = field(default_factory=lambda: [0.10, 0.05])
     val_calib_fraction: float = 0.5  # fraction of the validation split reserved for conformal calibration
+    # Stride between calibration windows. None = window_size, i.e. make them
+    # non-overlapping. At stride 1 the calibration set is 99%-overlapping
+    # windows, so zeta^lag decays across redundant copies of the same
+    # instant: on this dataset that left an effective sample size of 99 out
+    # of 28,375 (~100 s of one segment). Test/val stay at stride 1.
+    calib_stride: Optional[int] = None
     train_frac: float = 0.70
     val_frac: float = 0.15
-    # test_frac is implicitly 1 - train_frac - val_frac, per file, in time order
+    # test_frac is implicitly 1 - train_frac - val_frac; under the default
+    # segment split it is a whole-segment share, not a per-file time slice.
 
     # --- TCN backbone (Table I) ---
     in_channels: int = 3  # voltage, current, temperature

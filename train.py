@@ -91,7 +91,7 @@ def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include
 
     X_train, y_train = make_windows(train_frames, cfg.window_size, cfg.stride)
     X_val, y_val = make_windows(val_model_frames, cfg.window_size, cfg.stride)
-    X_calib, y_calib = make_windows(calib_frames, cfg.window_size, stride=1)
+    X_calib, y_calib = make_windows(calib_frames, cfg.window_size, cfg.calib_stride or cfg.window_size)
     X_test, y_test = make_windows(test_frames, cfg.window_size, stride=1)
 
     scaler = Standardizer().fit(X_train)
@@ -228,6 +228,10 @@ def main():
     parser.add_argument("--data-root", type=str, default=None, help="Path to a local copy of the LG 18650HG2 dataset.")
     parser.add_argument("--download", action="store_true", help="Download the dataset via kagglehub first.")
     parser.add_argument("--dataset-slug", type=str, default="aditya9790/lg-18650hg2-liion-battery-data")
+    parser.add_argument("--rated-capacity", type=float, default=None,
+                         help="Force one coulomb-counting capacity (Ah) for every temperature. "
+                              "Default: measure each temperature's usable 1C capacity from its own "
+                              "Cap_1C/C20DisCh section.")
     parser.add_argument("--current-sign", type=float, default=1.0, help="1.0 if I>0 means charging, -1.0 if I>0 means discharging.")
     parser.add_argument("--include-all", action="store_true",
                          help="Include static characterization test sections (C/20, OCV, HPPC, ...) instead of "
@@ -248,6 +252,9 @@ def main():
     parser.add_argument("--resample-dt", type=float, default=None,
                          help="Uniform resampling interval in seconds applied to each reconstructed "
                               "measurement run before windowing (default 1.0). Pass 0 to disable resampling.")
+    parser.add_argument("--calib-stride", type=int, default=None,
+                         help="Stride between conformal calibration windows (default: window_size, i.e. "
+                              "non-overlapping). Pass 1 to reproduce the fully overlapping calibration set.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default="outputs")
     args = parser.parse_args()
@@ -263,6 +270,10 @@ def main():
         cfg.window_size = args.window_size
     if args.resample_dt is not None:
         cfg.resample_dt_s = args.resample_dt or None
+    if args.rated_capacity is not None:
+        cfg.rated_capacity_ah = args.rated_capacity
+    if args.calib_stride is not None:
+        cfg.calib_stride = args.calib_stride
 
     set_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

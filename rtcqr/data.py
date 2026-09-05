@@ -25,25 +25,30 @@ section values used for grouping below.
 Critically, one CSV is *not* one independent test: filenames look like
 "<measurement_id>_<TestSection>.csv", and files sharing the same
 "Measurement ID" are chronologically contiguous slices of a single
-continuous cycler run (confirmed via each row's own timestamp -- the
-file-level "Start Time"/"End Time" metadata is identical across every
-section of a measurement, since it's the measurement's overall span, not
-the individual section's). Treating each file as its own independent test
+continuous cycler run (confirmed on the program clock, which runs
+unbroken across every section of all 16 measurements -- the file-level
+"Start Time"/"End Time" metadata is identical across every section of a
+measurement, since it's the measurement's overall span, not the
+individual section's). Treating each file as its own independent test
 starting from a full charge is therefore wrong for any section after the
 first in a run. This module instead:
 
   1. Groups files by Measurement ID (from metadata; falls back to
      treating each file as its own group if a copy of the dataset lacks
      the metadata preamble, e.g. a flatter CSV re-export).
-  2. Concatenates all sections of a group, sorted by each row's own
-     timestamp, deduplicated.
+  2. Concatenates all sections of a group, ordered and deduplicated on
+     the cycler's millisecond "Prog Time" program clock rather than the
+     whole-second "Time Stamp" wall clock -- see `_parse_prog_time` for
+     why the latter both loses 90% of the samples and is not always
+     self-consistent.
   3. Computes SoC via coulomb counting *once*, continuously, across the
      whole reconstructed run, so SoC(0)=1.0 is only assumed at the start
      of the run's earliest available section, with the running value
-     clipped to [0, 1] at *every* step (not once at the end -- see
-     `_compute_soc_from_current` for why this matters for measurements
-     that are repeated charge/discharge cycling runs rather than one
-     continuous depleting sweep).
+     clipped to [0, 1] at *every* step (see `_compute_soc_from_current`).
+     The denominator is the usable 1C capacity measured at that test
+     temperature, not the 3 Ah nameplate rating -- see
+     `_measure_reference_capacities`, and note that the two differ by up
+     to 1.36 Ah at -20 degC.
      (The per-row Capacity[Ah] column looked promising for this but is
      unreliable: it resets to 0 at internal step boundaries, so only the
      raw Current signal is used.)
@@ -111,6 +116,10 @@ _KEYWORDS = {
 _DEFAULT_INCLUDE_PATTERNS = ["hwfet", "udds", "la92", "us06", "mixed"]
 
 _KNOWN_DATETIME_FORMATS = ["%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %H:%M:%S"]
+
+# Column holding the cycler's own program clock. See `_parse_prog_time` for
+# why this, not "Time Stamp", is the time base used within a measurement.
+_PROG_TIME_KEYWORDS = ["prog time", "prog_time", "test_time"]
 
 
 def download_lg_hg2(dataset_slug: str = "aditya9790/lg-18650hg2-liion-battery-data") -> str:
@@ -261,6 +270,51 @@ def _parse_datetime_column(raw: pd.Series) -> pd.Series:
     return pd.to_datetime(numeric, unit="s", origin="unix", errors="coerce")
 
 
+def _parse_prog_time(raw: pd.Series) -> Optional[np.ndarray]:
+    """Parse the cycler's "Prog Time" program clock to seconds, or return
+    None if this file's copy of it is unusable.
+
+    This is the time base to prefer over "Time Stamp", for two reasons
+    measured on the real dataset:
+
+      1. **Resolution.** "Time Stamp" is whole-second ("11/29/2018 6:53:50
+         PM") while drive cycles are logged at 0.1 s, so ten consecutive
+         rows share one timestamp. Deduplicating on it discards 90% of
+         every drive-cycle file (159,646 rows -> 15,966 in 551_UDDS).
+         "Prog Time" is millisecond-resolution ("06:40:55.195").
+      2. **Integrity.** "Time Stamp" is not always self-consistent: in
+         582_LA92 the wall clock jumps between 11/25 21:00 and 11/26 10:11
+         and back while Prog Time advances smoothly, and 571_Mixed6 jumps
+         10.4 h mid-file. Sorting on it reorders rows and manufactures
+         >300 s "gaps" that split one drive cycle into fragments.
+
+    The hours field is a running program total, not a clock hour, so it
+    exceeds 24 on long runs ("32:11:19.479"). Format is HH:MM:SS.mmm, but
+    at least one file (549_Charge.csv) carries an Excel-mangled MM:SS.s
+    ("53:49.7") that wraps and therefore cannot be a program clock; such a
+    column is rejected here so the caller falls back to "Time Stamp".
+    """
+    parts = raw.astype(str).str.strip().str.split(":", expand=True)
+    # Require all three fields. A two-field column is the Excel-mangled
+    # MM:SS.s variant, which wraps every hour and so cannot represent a
+    # multi-hour program clock; the caller falls back to "Time Stamp".
+    if parts.shape[1] != 3:
+        return None
+    seconds = (
+        pd.to_numeric(parts[0], errors="coerce") * 3600.0
+        + pd.to_numeric(parts[1], errors="coerce") * 60.0
+        + pd.to_numeric(parts[2], errors="coerce")
+    )
+    values = seconds.to_numpy(dtype=float)
+    if not np.isfinite(values).all():
+        return None
+    # Deliberately *not* requiring the values to be sorted: a few files
+    # (582_LA92) store a block of rows out of sequence, which shows up as a
+    # backwards step in both time columns. The clock itself is sound, so the
+    # caller repairs the ordering by sorting on it.
+    return values
+
+
 def _compute_soc_from_current(
     time_s: np.ndarray,
     current_a: np.ndarray,
@@ -281,24 +335,21 @@ def _compute_soc_from_current(
     The running SoC is clipped to [0, 1] at *every* step, not once at the
     end. A real cell physically cannot exceed 100% SoC -- charging current
     that keeps flowing during CV tapering near full charge doesn't store
-    energy beyond capacity. This matters for measurements that are
-    repeated charge/discharge cycling runs (a "Charge_N" section fully
-    recharging the cell, then a "Mixed_N" section discharging it, repeated
-    many times) rather than one continuous depleting drive-cycle sweep:
-    confirmed on a real sample where 5 repeated Charge/Mixed cycles each
-    individually charge/discharge ~2.3-2.5 Ah (roughly 80% of the 3 Ah
-    rated capacity) against each other. A single end-of-array clip lets
-    the *unclipped* running sum drift arbitrarily far above 1.0 whenever
-    several charge segments land close together in the reconstructed
-    timeline before their matching discharge segments (order depends on
-    each row's real timestamp, not the paper's "Charge_N pairs with
-    Mixed_N" naming) -- e.g. repeated +0.8-SoC charges stacking up to +5.6
-    before any clipping is ever applied, so that even five subsequent
-    ~0.8-SoC discharges only bring the unclipped value down to +1.7,
-    which still displays as a flat 1.0 for the entire span once clipped.
-    Clipping at every step instead makes each charge segment correctly
-    saturate at 1.0 (as a real cell does) before the next discharge
-    segment starts, recovering the true sawtooth SoC pattern.
+    energy beyond capacity -- so a single end-of-array clip would let the
+    running sum drift above 1.0 and stay there, flattening real depletion
+    into a constant 1.0.
+
+    Ordered on the program clock, the runs in this dataset alternate
+    cleanly (m590: +2.437, -2.329, +2.320, -2.327, ... Ah), so charge
+    sections do not in fact stack up ahead of their discharges. What
+    per-step clipping actually buys here is absorbing a wrong
+    `soc_initial`: three measurements (m590 at 3.24 V, m562 at 3.08 V,
+    m549 at 3.10 V) have an earliest archived section that does not start
+    from a full charge, so SoC(0)=1.0 is wrong for them. Their first
+    charge section saturates at 1.0 instead of overshooting, and the
+    trajectory is re-synchronized by the time the first drive cycle
+    starts -- measured across every emitted segment, none begins below
+    SoC 0.85.
     """
     dt = np.diff(time_s, prepend=time_s[0])
     dt[0] = 0.0
@@ -337,6 +388,8 @@ def _parse_file_raw(path: str, overrides: Optional[Dict[str, str]]):
         return None
 
     abs_time = _parse_datetime_column(df[cols["time"]])
+    prog_col = _match_column(df.columns, _PROG_TIME_KEYWORDS)
+    prog_time = _parse_prog_time(df[prog_col]) if prog_col is not None else None
     voltage = pd.to_numeric(df[cols["voltage"]], errors="coerce")
     current = pd.to_numeric(df[cols["current"]], errors="coerce")
     temperature = pd.to_numeric(df[cols["temperature"]], errors="coerce")
@@ -351,6 +404,7 @@ def _parse_file_raw(path: str, overrides: Optional[Dict[str, str]]):
 
     frame = pd.DataFrame({
         "abs_time": abs_time[valid],
+        "prog_time": pd.Series(prog_time, index=df.index)[valid] if prog_time is not None else np.nan,
         "voltage": voltage[valid],
         "current": current[valid],
         "temperature": temperature[valid],
@@ -407,20 +461,106 @@ class BatteryFile:
     frame: pd.DataFrame  # columns: time, voltage, current, temperature, soc (time-sorted, uniform rate)
 
 
+def _measure_reference_capacities(groups: Dict[str, List[dict]]) -> Dict[Optional[float], float]:
+    """Measure the usable 1C discharge capacity at each test temperature,
+    by integrating the discharge current of that temperature's `Cap_1C`
+    characterization section (falling back to `C20DisCh`).
+
+    SoC has to be referenced to the capacity actually available at the
+    test temperature, not to the cell's 3 Ah nameplate rating. The dataset
+    makes the difference impossible to ignore: every drive cycle at every
+    temperature ends with the cell at its 2.8 V discharge cut-off -- i.e.
+    empty -- but dividing the same coulomb count by a fixed 3.0 Ah labels
+    that identical physical state as SoC 0.12 at 25 degC and SoC 0.44 at
+    -20 degC. Measured here (mean of each temperature's Cap_1C sections):
+
+        -20 degC  1.64 Ah      10 degC  2.52 Ah
+        -10 degC  2.25 Ah      25 degC  2.71 Ah
+          0 degC  2.47 Ah      40 degC  2.50 Ah
+
+    This is also the capacity the test protocol itself is written against:
+    drive cycles repeat "until 95% of the 1C discharge capacity at the
+    respective temperature has been discharged", so normalizing by it puts
+    the end of each drive cycle near SoC 0.05 as intended.
+    """
+    per_condition: Dict[Optional[float], Dict[str, List[float]]] = defaultdict(
+        lambda: {"cap_1c": [], "c20": []}
+    )
+    for parts in groups.values():
+        for part in parts:
+            frame, section = part["frame"], part["frame"]["test_section"].iloc[0]
+            low = str(section).lower()
+            kind = "cap_1c" if "cap_1c" in low else ("c20" if "c20" in low else None)
+            if kind is None:
+                continue
+            time_s = _group_time_base(frame)
+            if time_s is None:
+                continue
+            dt = np.clip(np.diff(time_s, prepend=time_s[0]), 0.0, None)
+            dt[0] = 0.0
+            current = frame["current"].to_numpy(dtype=float)
+            discharged = -float(np.nansum(np.clip(current, None, 0.0) * dt)) / 3600.0
+            if discharged > 0.1:
+                per_condition[part["condition"]][kind].append(discharged)
+
+    out: Dict[Optional[float], float] = {}
+    for condition, measured in per_condition.items():
+        for kind in ("cap_1c", "c20"):
+            if measured[kind]:
+                out[condition] = float(np.mean(measured[kind]))
+                break
+    return out
+
+
+def _group_time_base(frame: pd.DataFrame) -> Optional[np.ndarray]:
+    """Seconds-since-start for one already-ordered frame, preferring the
+    millisecond-resolution program clock over the whole-second wall clock."""
+    if "prog_time" in frame and frame["prog_time"].notna().all():
+        values = frame["prog_time"].to_numpy(dtype=float)
+        return values - values[0]
+    if "abs_time" in frame:
+        return (frame["abs_time"] - frame["abs_time"].iloc[0]).dt.total_seconds().to_numpy(dtype=float)
+    return None
+
+
+def _is_dynamic_segment(seg: pd.DataFrame, min_current_std_a: float) -> bool:
+    """Whether a segment actually carries a dynamic load profile.
+
+    Section *names* are not sufficient on their own: 551_HWFET is a
+    complete, uncorrupted file whose program clock runs straight from
+    551_Charge3 into 551_Charge4 with no room for a drive cycle in
+    between -- the 25 degC HWFET run recorded only its 600 s rest step,
+    current identically 0 A. Windowing that as a drive cycle feeds the
+    model hundreds of constant-voltage rest samples labelled as dynamic
+    load. Checking the signal itself catches this without a per-file
+    blacklist.
+    """
+    return float(np.std(seg["current"].to_numpy(dtype=float))) >= min_current_std_a
+
+
 def load_lg_hg2_dataframe(
     root: str,
-    rated_capacity_ah: float = 3.0,
+    rated_capacity_ah: Optional[float] = None,
     current_sign: float = 1.0,
     soc_initial: float = 1.0,
     include_patterns: Optional[Sequence[str]] = _DEFAULT_INCLUDE_PATTERNS,
     resample_dt_s: Optional[float] = 1.0,
     max_gap_s: float = 300.0,
+    min_current_std_a: float = 0.05,
+    fallback_capacity_ah: float = 3.0,
     column_overrides: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> List[BatteryFile]:
     """Load and reconstruct every measurement run under `root` into a list
     of BatteryFile windowing segments. See the module docstring for the
     grouping/stitching/resampling procedure. Only test sections matching
     `include_patterns` are kept for windowing (pass None to keep all).
+
+    `rated_capacity_ah` is the denominator of the coulomb count. Leave it
+    at None (the default) to measure the usable 1C capacity at each test
+    temperature from that temperature's own characterization sections --
+    see `_measure_reference_capacities` for why a fixed nameplate 3 Ah
+    mislabels the SoC by up to 0.44 at low temperature. Pass a float to
+    force one capacity for every temperature.
 
     `column_overrides` maps a filename (basename) to a per-field column-name
     override dict, for files where auto-detection needs help, e.g.:
@@ -438,15 +578,35 @@ def load_lg_hg2_dataframe(
         frame["test_section"] = test_section
         groups[group_key].append({"frame": frame, "condition": condition, "path": path})
 
+    if rated_capacity_ah is None:
+        capacities = _measure_reference_capacities(groups)
+        for condition in sorted(capacities, key=lambda c: (c is None, c)):
+            print(f"[rtcqr.data] reference capacity at {condition} degC: {capacities[condition]:.3f} Ah "
+                  f"(measured; nameplate is {fallback_capacity_ah:.1f} Ah)")
+    else:
+        capacities = {}
+
     out: List[BatteryFile] = []
     for group_key, parts in groups.items():
         combined = pd.concat([p["frame"] for p in parts], ignore_index=True)
-        combined = combined.sort_values("abs_time").drop_duplicates(subset=["abs_time"], keep="first")
+        # Order and deduplicate on the program clock where every section of
+        # this measurement carries a usable one; "Time Stamp" is only a
+        # whole-second, and sometimes internally inconsistent, fallback.
+        if combined["prog_time"].notna().all():
+            time_key = "prog_time"
+        else:
+            time_key = "abs_time"
+            print(f"[rtcqr.data] measurement {group_key}: no usable program clock, falling back to the "
+                  f"whole-second 'Time Stamp' (sub-second samples will be dropped).")
+        combined = combined.sort_values(time_key).drop_duplicates(subset=[time_key], keep="first")
         combined = combined.reset_index(drop=True)
         if len(combined) < 20:
             continue
 
-        combined["time"] = (combined["abs_time"] - combined["abs_time"].iloc[0]).dt.total_seconds()
+        if time_key == "prog_time":
+            combined["time"] = combined["prog_time"] - combined["prog_time"].iloc[0]
+        else:
+            combined["time"] = (combined["abs_time"] - combined["abs_time"].iloc[0]).dt.total_seconds()
 
         gaps = combined["time"].diff().to_numpy()
         big_gaps = gaps[gaps > max_gap_s]
@@ -456,6 +616,11 @@ def load_lg_hg2_dataframe(
                   f"{max_gap_s:.0f}s (largest {np.nanmax(big_gaps):.0f}s) -- likely missing intermediate "
                   f"test-section files; SoC will not account for current drawn during the gap(s), and each "
                   f"gap becomes a windowing segment boundary.")
+
+        condition = next((p["condition"] for p in parts if p["condition"] is not None), None)
+        capacity_ah = rated_capacity_ah
+        if capacity_ah is None:
+            capacity_ah = capacities.get(condition, fallback_capacity_ah)
 
         if combined["soc_raw"].notna().mean() > 0.5:
             soc = combined["soc_raw"].to_numpy()
@@ -467,11 +632,9 @@ def load_lg_hg2_dataframe(
         else:
             soc = _compute_soc_from_current(
                 combined["time"].to_numpy(), combined["current"].to_numpy(),
-                rated_capacity_ah, current_sign, soc_initial, max_gap_s=max_gap_s,
+                capacity_ah, current_sign, soc_initial, max_gap_s=max_gap_s,
             )
         combined["soc"] = soc
-
-        condition = next((p["condition"] for p in parts if p["condition"] is not None), None)
 
         if include_patterns:
             keep_mask = combined["test_section"].apply(lambda s: _matches_any(s, include_patterns)).to_numpy()
@@ -481,12 +644,23 @@ def load_lg_hg2_dataframe(
             continue
 
         for seg in _split_contiguous(combined, keep_mask, max_gap_s):
+            # Label each segment with the sections it actually spans, not
+            # the whole measurement's section list -- otherwise every
+            # segment of a run is indistinguishable in the inspect output.
+            seg_sections = ", ".join(dict.fromkeys(seg["test_section"].tolist()))
+            label = f"measurement {group_key} ({seg_sections})"
+            if include_patterns and not _is_dynamic_segment(seg, min_current_std_a):
+                print(f"[rtcqr.data] {label}: dropping {len(seg)} row(s) -- section is named as a drive "
+                      f"cycle but carries no dynamic load (current std "
+                      f"{np.std(seg['current'].to_numpy()):.4f} A < {min_current_std_a} A); "
+                      f"it recorded only a rest/pause step.")
+                continue
             seg = seg[["time", "voltage", "current", "temperature", "soc"]].reset_index(drop=True)
             if resample_dt_s:
                 seg = _resample_uniform(seg, resample_dt_s)
             if len(seg) < 20:
                 continue
-            out.append(BatteryFile(path=f"measurement {group_key} ({section_list})", condition=condition, frame=seg))
+            out.append(BatteryFile(path=label, condition=condition, frame=seg))
 
     if not out:
         raise RuntimeError(

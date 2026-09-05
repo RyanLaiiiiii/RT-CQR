@@ -23,8 +23,9 @@ LG 18650HG2 Li-ion battery dataset, following:
 - `rtcqr/metrics.py` — LVR, AIW, ACE, eq. (29).
 - `rtcqr/data.py` — LG 18650HG2 loading: auto-detected column mapping,
   grouping/stitching multi-file measurement runs in true chronological
-  order, coulomb-counting SoC computation, uniform-rate resampling,
-  chronological train/val/calib/test split, and sliding-window
+  order on the cycler's millisecond program clock, per-temperature
+  capacity measurement, coulomb-counting SoC computation, uniform-rate
+  resampling, segment-wise train/val/calib/test split, and sliding-window
   construction.
 - `train.py` — end-to-end training + calibration + evaluation CLI.
 
@@ -76,10 +77,10 @@ immediately followed by `589_Cap_1C` (11/29 20:59-21:59), and later
 `589_HWFET` and `589_Mixed1`, all part of measurement 589, in that order.
 (The file-level `Start Time`/`End Time` metadata is identical across all
 of them -- it's the whole measurement's span, not the individual
-section's, so true ordering has to come from each row's own timestamp.)
+section's, so true ordering has to come from each row's own clock.)
 `load_lg_hg2_dataframe` groups files by Measurement ID, concatenates them
-in timestamp order, and computes SoC via coulomb counting *once*, across
-the whole reconstructed run -- so `SoC(0) = 1.0` is only assumed at the
+in program-clock order, and computes SoC via coulomb counting *once*,
+across the whole reconstructed run -- so `SoC(0) = 1.0` is only assumed at the
 start of a run's earliest available section, not at the start of every
 individual file. (A tempting shortcut would be to use the per-row
 cumulative `Capacity[Ah]` column instead of re-integrating `Current`, but
@@ -87,23 +88,78 @@ it turned out to reset to 0 at internal step boundaries -- confirmed on
 `589_Charge1`, where it drops from 0.01126 back to 0.00000 partway
 through the same file -- so only `Current` is used.)
 
+### Time base: use `Prog Time`, not `Time Stamp`
+
+Order within a measurement comes from the cycler's own program clock
+(`Prog Time`, e.g. `06:40:55.195`), not from the wall-clock `Time Stamp`.
+Two reasons, both measured on the real dataset:
+
+- **Resolution.** `Time Stamp` is whole-second, but drive cycles are
+  logged at 0.1 s, so ten consecutive rows carry the same value.
+  Deduplicating on it silently discards 90% of every drive-cycle file
+  (`551_UDDS`: 159,646 rows -> 15,966). `Prog Time` is millisecond
+  resolution, so the native 0.1 s dynamics survive and `--resample-dt 0.1`
+  is meaningful.
+- **Integrity.** `Time Stamp` is not always self-consistent. In
+  `582_LA92` it jumps between 11/25 21:00 and 11/26 10:11 and back while
+  `Prog Time` advances smoothly; `571_Mixed6` jumps 10.4 h mid-file.
+  Sorting on it reordered rows and manufactured >300 s "gaps" that split
+  single drive cycles into fragments. Sorting on `Prog Time` removes
+  those fragments.
+
+The hours field is a running program total, so it exceeds 24 on long runs
+(`32:11:19.479`). One file (`549_Charge.csv`) carries an Excel-mangled
+`MM:SS.s` variant that cannot represent a multi-hour clock; it is
+rejected and that measurement falls back to `Time Stamp`.
+
+Program clocks are per-measurement and *overlap* between measurements
+(at 10 degC, `m576` spans 0.018-18.912 h and `m582` spans 7.928-10.451 h),
+so the clock is only ever used to order *within* a group -- cross-group
+identity still comes from the Measurement ID.
+
+### SoC is referenced to the capacity at the test temperature
+
+`rated_capacity_ah` defaults to `None`, meaning "measure it". For each
+temperature the loader integrates that temperature's own `Cap_1C`
+section (falling back to `C20DisCh`):
+
+| T (degC) | -20 | -10 | 0 | 10 | 25 | 40 |
+|---|---|---|---|---|---|---|
+| measured 1C capacity (Ah) | 1.64 | 2.25 | 2.47 | 2.52 | 2.71 | 2.50 |
+
+Using the 3 Ah nameplate instead is not a small error. Every drive cycle
+at every temperature ends with the cell at its 2.8 V discharge cut-off --
+i.e. empty -- but a fixed 3.0 Ah denominator labels that identical
+physical state as SoC 0.12 at 25 degC and SoC **0.44** at -20 degC. With
+`soc_min = 0.10` that made SoC dip below `soc_min` *nowhere* in the
+dataset, so LVR was identically 0 for every method, the violation
+indicator `u_i` was identically 0 (making `wl1` and `gamma` inert, and
+RT-CQR's violation weighting a no-op), and the lower-tail regularizer had
+nothing to penalize. Normalizing per temperature puts the end of each
+drive cycle at a median SoC of 0.041 -- matching the protocol's own
+"repeat until 95% of the 1C discharge capacity at the respective
+temperature has been discharged" -- and 13.7% of samples now sit below
+`soc_min`. Pass `--rated-capacity 3.0` to force the old behaviour.
+
 The running SoC is clipped to `[0, 1]` at *every* step of the coulomb
-count, not once at the end. This matters for measurements that are
-**repeated charge/discharge cycling runs** rather than one continuous
-depleting sweep -- confirmed on real data where a `Charge_N` section
-recharges the cell (~+2.3-2.5 Ah, ~80% of the 3 Ah rated capacity) and the
-following `Mixed_N` section discharges it by a similar amount, repeated
-many times. A single end-of-array clip lets the *unclipped* running sum
-drift arbitrarily far above 1.0 whenever several charge segments land
-close together in the true chronological order before their matching
-discharge segments (order follows each row's real timestamp, not the
-`Charge_N`-pairs-with-`Mixed_N` naming) -- e.g. several +80%-SoC charges
-stacking up before any clipping is applied, so that even several
-subsequent ~80%-SoC discharges only bring the unclipped value back down
-to some other value still above 1.0, which displays as a flat 1.0 for the
-entire span once clipped, masking real depletion. Clipping at every step
-instead makes each charge segment correctly saturate at 1.0 (as a real
-cell does) before the next discharge segment starts.
+count, not once at the end. A real cell physically cannot exceed 100%
+SoC, and charging current that keeps flowing during CV tapering near full
+charge doesn't store energy beyond capacity. This also absorbs the
+`SoC(0) = 1.0` assumption being wrong for the three measurements whose
+earliest archived section does not start from a full charge
+(`m590` at 3.24 V, `m562` at 3.08 V, `m549` at 3.10 V): the first charge
+section saturates at 1.0, and by the first drive cycle the trajectory has
+re-synchronized. With every segment checked, none now starts below SoC
+0.85.
+
+### Sections named as drive cycles that contain no drive cycle
+
+`551_HWFET` is a complete, uncorrupted file whose program clock runs
+straight from `551_Charge3` into `551_Charge4` with no room for a drive
+cycle in between: the 25 degC HWFET run recorded only its 600 s rest
+step, current identically 0 A. A name-based whitelist cannot see this, so
+segments are additionally required to carry actual dynamic load
+(`min_current_std_a`, default 0.05 A) before being windowed.
 
 If your copy of the dataset is missing an intermediate section for some
 measurement, there will be a real time gap in the stitched run where SoC
@@ -223,6 +279,14 @@ python train.py --data-root /path/to/lg_hg2 --calibrators cqr --output-dir outpu
 - `--resample-dt S` — uniform resampling interval in seconds before
   windowing (default 1.0); pass 0 to window over native sampling instead.
 - `--current-sign {1,-1}` — coulomb-counting sign convention (see above).
+- `--rated-capacity AH` — force one coulomb-counting capacity for every
+  temperature instead of measuring each temperature's own (see above).
+- `--calib-stride N` — stride between conformal calibration windows
+  (default: `window_size`, i.e. non-overlapping). At stride 1 the
+  calibration set is 99%-overlapping windows, so `zeta^lag` decays across
+  redundant copies of the same instant: 95% of the calibration weight
+  then falls inside the last 2.5 minutes of one segment, versus 4.1 hours
+  at the default stride.
 - `--split-mode {segment,chronological}` — how train/val/calib/test are
   carved out (see above); default `segment`.
 - `--include-all` — keep static characterization test sections instead of
