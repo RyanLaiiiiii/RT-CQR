@@ -33,6 +33,7 @@ from dataclasses import asdict, replace
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -128,22 +129,56 @@ def _report_split_conditions(train, val, calib, test) -> None:
               f"calib. Their radius is fitted entirely on conditions that behave differently.")
 
 
-def _carve_calibration(val_frames, val_calib_fraction: float):
-    """Hold the tail of each validation segment out as the calibration set.
+def _carve_calibration(val_frames, val_calib_fraction: float, n_blocks: int = 10):
+    """Hold part of each validation segment out as the calibration set.
 
     Sec. IV.B calibrates "on a common subset held out from the validation
-    set". Taking each segment's tail rather than whole segments keeps every
-    ambient condition represented in both halves -- with one validation cycle
-    per temperature, assigning whole segments would leave conditions out of
-    calibration entirely, and a condition that reaches test without reaching
-    calib gets a radius fitted on conditions unlike it.
+    set". Splitting *within* each segment rather than assigning whole
+    segments keeps every ambient condition represented in both halves --
+    with one validation cycle per temperature, assigning whole segments
+    would leave conditions out of calibration entirely, and a condition that
+    reaches test without reaching calib gets a radius fitted on conditions
+    unlike it.
+
+    Each segment is cut into `n_blocks` contiguous blocks and blocks are
+    dealt alternately, rather than simply handing calibration the segment's
+    tail. A validation cycle here discharges monotonically from full, so its
+    tail *is* its low-SoC end: a plain tail split gave calibration
+    SoC [0.02, 0.53] against test's [0.01, 1.00] -- a 0.22 gap in mean SoC,
+    with the entire upper half of the range unrepresented. The radius is
+    then fitted where test mostly is not, which lands straight on ACE.
+    Interleaving lets both halves span the whole cycle while keeping
+    calibration in chronological order, which `conformal.time_decay_weights`
+    needs. `n_blocks=1` restores the old tail split.
     """
     val_model_frames, calib_frames = [], []
     for bf in val_frames:
-        n_val = len(bf.frame)
-        n_cal = int(round(n_val * val_calib_fraction))
-        val_model_frames.append(replace(bf, frame=bf.frame.iloc[:n_val - n_cal].reset_index(drop=True)))
-        calib_frames.append(replace(bf, frame=bf.frame.iloc[n_val - n_cal:].reset_index(drop=True)))
+        n_rows = len(bf.frame)
+        blocks = max(1, min(n_blocks, n_rows))
+        edges = np.linspace(0, n_rows, blocks + 1).round().astype(int)
+        t0 = float(bf.frame["time"].iloc[0])
+        # Deal block i to calibration when the running quota crosses an
+        # integer, which spreads `val_calib_fraction` of the blocks evenly
+        # over the cycle instead of bunching them at one end.
+        taken = 0
+        for i in range(blocks):
+            lo, hi = edges[i], edges[i + 1]
+            if hi <= lo:
+                continue
+            want_calib = int((i + 1) * val_calib_fraction) > int(i * val_calib_fraction)
+            chunk = bf.frame.iloc[lo:hi].reset_index(drop=True)
+            start = bf.start_time
+            if start is not None:
+                start = start + pd.to_timedelta(float(chunk["time"].iloc[0]) - t0, unit="s")
+            part = replace(bf, frame=chunk, start_time=start)
+            (calib_frames if want_calib else val_model_frames).append(part)
+            taken += want_calib
+        if taken == 0 and val_calib_fraction > 0:
+            # Degenerate case (e.g. a single-block segment): fall back to the
+            # tail split rather than leaving this condition out of calibration.
+            n_cal = max(1, int(round(n_rows * val_calib_fraction)))
+            val_model_frames[-1:] = [replace(bf, frame=bf.frame.iloc[:n_rows - n_cal].reset_index(drop=True))]
+            calib_frames.append(replace(bf, frame=bf.frame.iloc[n_rows - n_cal:].reset_index(drop=True)))
     return val_model_frames, calib_frames
 
 
@@ -153,11 +188,11 @@ def _warn_if_calib_unrepresentative(calib_frames, test_frames) -> None:
     Calib and test are never exchangeable here (see `conformal`'s module
     docstring: the method targets weighted empirical coverage precisely
     because they are not), so this is not a guarantee check. It is a
-    magnitude check: carving calibration from the tail of each validation
-    cycle biases it toward that cycle's low-SoC end while test spans whole
-    cycles, and the wider that gap, the more the fitted radius is simply the
+    magnitude check: the wider the gap between the SoC range calibration
+    covers and the one test covers, the more the fitted radius is simply the
     wrong size for test -- worth seeing now rather than inferring later from
-    a large ACE.
+    a large ACE. See `_carve_calibration` for how the two are interleaved to
+    keep this gap small.
     """
     calib_soc = np.concatenate([bf.frame["soc"].to_numpy() for bf in calib_frames])
     test_soc = np.concatenate([bf.frame["soc"].to_numpy() for bf in test_frames])
@@ -168,7 +203,7 @@ def _warn_if_calib_unrepresentative(calib_frames, test_frames) -> None:
     if gap > 0.1:
         print(f"[rtcqr.train] WARNING: calib and test mean SoC differ by {gap:.3f}. The radius is fitted "
               f"on a part of the SoC range test does not represent, which inflates ACE for every "
-              f"calibrator. Lower --val-calib-fraction to keep more of each validation cycle in calibration.")
+              f"calibrator. Raise --calib-blocks to interleave the two more finely.")
 
 
 def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include_all: bool = False,
@@ -195,7 +230,8 @@ def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include
         # drive cycle, with calibration held out from the validation set.
         train_frames, val_frames, test_frames = fixed_split(
             files, conditions=fixed_conditions if fixed_conditions is not None else PAPER_FIXED_CONDITIONS)
-        val_model_frames, calib_frames = _carve_calibration(val_frames, cfg.val_calib_fraction)
+        val_model_frames, calib_frames = _carve_calibration(
+            val_frames, cfg.val_calib_fraction, cfg.calib_blocks)
     elif split_mode == "segment":
         # Most segments in this dataset are short, single charge/discharge
         # cycles (SoC ~1.0 -> some low point over a few hours). Slicing each
@@ -211,7 +247,8 @@ def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include
         )
     else:
         train_frames, val_frames, test_frames = chronological_split(files, cfg.train_frac, cfg.val_frac)
-        val_model_frames, calib_frames = _carve_calibration(val_frames, cfg.val_calib_fraction)
+        val_model_frames, calib_frames = _carve_calibration(
+            val_frames, cfg.val_calib_fraction, cfg.calib_blocks)
 
     # The conformal time decay (conformal.time_decay_weights) reads buffer
     # position as time, weighting the last entries as "now". Segments arrive
@@ -558,6 +595,11 @@ def main():
     parser.add_argument("--val-calib-fraction", type=float, default=None, metavar="F",
                          help="Fraction of each validation segment held out for conformal calibration "
                               "(default 0.5).")
+    parser.add_argument("--calib-blocks", type=int, default=None, metavar="N",
+                         help="Cut each validation segment into N contiguous blocks and deal them "
+                              "alternately to val/calib (default 10), so both span the whole cycle. A "
+                              "validation cycle discharges monotonically from full, so N=1 -- a plain tail "
+                              "split -- hands calibration only that cycle's low-SoC end and inflates ACE.")
     parser.add_argument("--output-dir", type=str, default="outputs")
     parser.add_argument("--num-workers", type=int, default=0,
                          help="DataLoader worker processes for batch assembly (default 0). The dataset is "
@@ -617,6 +659,8 @@ def main():
         cfg.resample_dt_s = args.resample_dt or None
     if args.val_calib_fraction is not None:
         cfg.val_calib_fraction = args.val_calib_fraction
+    if args.calib_blocks is not None:
+        cfg.calib_blocks = args.calib_blocks
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[rtcqr.train] device={device}")

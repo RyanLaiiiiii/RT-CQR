@@ -36,7 +36,12 @@ class RTCQRConfig:
     )
     # nominal miscoverage alpha for each evaluated PI (90% and 95%)
     pi_alphas: List[float] = field(default_factory=lambda: [0.10, 0.05])
-    val_calib_fraction: float = 0.5  # fraction of the validation split reserved for conformal calibration
+    val_calib_fraction: float = 0.5
+    # How many contiguous blocks each validation segment is cut into before
+    # dealing them alternately to val/calib (see train._carve_calibration).
+    # 1 reproduces a plain tail split, which on this data hands calibration
+    # only the low-SoC end of every validation cycle.
+    calib_blocks: int = 10  # fraction of the validation split reserved for conformal calibration
     train_frac: float = 0.70
     val_frac: float = 0.15
     # test_frac is implicitly 1 - train_frac - val_frac
