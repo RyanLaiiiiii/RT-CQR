@@ -27,44 +27,12 @@ LG 18650HG2 Li-ion battery dataset, following:
   resampling, temperature-stratified train/val/calib/test splitting, and
   sliding-window construction.
 - `train.py` — end-to-end training + calibration + evaluation CLI.
-- `tests/` — regression tests, run with `pytest`. Every test pins a bug that
-  used to corrupt results *silently* (a wrong capacity denominator does not
-  raise, it just moves every SoC label), so they are worth keeping green.
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
 ```
-
-### Running locally (outside Colab)
-
-`run_local.py` chains the whole verify-then-train flow -- install deps,
-get the dataset via kagglehub (or point at a local copy), run the test
-suite, check the reconstructed SoC labels, then train -- as one command on
-a machine with its own Python and GPU, so nothing depends on a Colab
-session's lifetime or its free-tier GPU quota:
-
-```bash
-# Full pipeline, downloading the dataset via kagglehub:
-python run_local.py --train --capacity-override 40:2.75 --min-soc-range 0.02
-
-# Already have a local copy:
-python run_local.py --data-root /path/to/lg_hg2 --train
-
-# Verify only; prints the train.py command instead of running it:
-python run_local.py --data-root /path/to/lg_hg2
-```
-
-It stops at the first failing stage (tests, then label checks) rather than
-spending time training on a broken environment or corrupted labels; pass
-`--force` to proceed anyway. `--skip-install` / `--skip-tests` / `--skip-check`
-skip individual stages. Kaggle API credentials
-(`~/.kaggle/kaggle.json` or `KAGGLE_USERNAME`/`KAGGLE_KEY`) are required
-only when `--data-root` is omitted. Do not carry `--capacity-override
-40:2.75` over to a different copy of the dataset without re-running
-`diag40.py` on it first -- see below for what that value means and why it
-is dataset-specific.
 
 ## Getting the data
 
@@ -97,14 +65,8 @@ the discharge finishes. Nothing about that section alone gives it away --
 only the *cross-condition* termination voltage does. Internal resistance
 falls as a cell warms, so a warmer cell holds its voltage up under load and
 reaches a fixed cutoff later, which means `v_end` must decrease
-monotonically with temperature. `diag40.py` prints that table and names any
-condition that stops early:
-
-```bash
-python diag40.py /path/to/lg_hg2
-```
-
-On the McMaster data this flags 40 degC, which terminates at 3.254 V --
+monotonically with temperature. On the McMaster data this table flags
+40 degC, which terminates at 3.254 V --
 182 mV *above* the colder 25 degC (3.072 V), while every other condition
 falls monotonically from -20 degC's 3.571 V. Its 2.496 Ah is therefore an
 under-estimate, not capacity fade (the campaign ran 25 degC before 40 degC,
@@ -120,9 +82,10 @@ comma-separated pairs. For sub-zero temperatures write `n20:1.70` (the
 dataset's own spelling) or use `--capacity-override=-20:1.70`; a bare
 `-20:1.70` is read by argparse as an option rather than a value. Both
 settings are recorded in `results.json`, so a run carries the assumptions it
-was produced under. `diagnose_calibration.py` takes the same two flags and
-they must match, or its split will not reproduce the one the model was
-trained on.
+was produced under. Re-derive the per-condition termination-voltage table
+above before carrying `--capacity-override 40:2.75` over to a different copy
+of the dataset -- the value is specific to this measurement's truncated
+section, not a property of the cell.
 
 The dataset is the LG 18650HG2 Li-ion battery cycler data collected by
 Dr. Phillip Kollmeyer at McMaster University, Hamilton, Ontario, Canada
@@ -382,27 +345,6 @@ python train.py --data-root /path/to/lg_hg2 --calibrators cqr --output-dir outpu
   an in-RAM `TensorDataset`, so workers mostly add per-batch pickling —
   measure before raising it).
 - `--max-epochs`, `--patience`, `--seed` — training controls.
-
-## Checking the labels before you train
-
-The SoC labels are reconstructed, not published (see above), so verify them
-before spending GPU time:
-
-```bash
-python check_soc.py /path/to/lg_hg2
-```
-
-It reports frozen segments (SoC pinned at a clip, the signature of a
-capacity denominator that is too small), per-condition SoC coverage, and
-whether any sample actually falls below `soc_min` -- if none does, LVR is
-trivially 0 for every method and the violation-weighting mechanism is never
-exercised. Exits non-zero when something is wrong, so it works in a script.
-
-## Tests
-
-```bash
-pip install -r requirements.txt && pytest
-```
 
 ## Method summary
 

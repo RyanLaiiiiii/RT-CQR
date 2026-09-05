@@ -2,6 +2,3 @@ torch>=2.0
 numpy>=1.23
 pandas>=1.5
 kagglehub>=0.3
-
-# tests
-pytest>=7.0

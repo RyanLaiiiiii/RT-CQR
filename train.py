@@ -404,7 +404,8 @@ def main():
                          help="Override a condition's measured capacity, e.g. --capacity-override 40:2.75. "
                               "Repeatable, and accepts comma-separated pairs. Use for a Cap_1C section that "
                               "ran a normal duration from a full charge but stopped before the discharge "
-                              "finished -- run diag40.py to identify one. For sub-zero temperatures write "
+                              "finished -- identify one by checking per-condition termination voltage: it "
+                              "should decrease monotonically as temperature rises. For sub-zero temperatures write "
                               "n20:1.70, or use the --capacity-override=-20:1.70 form (a bare -20:1.70 is "
                               "read as an option, not a value).")
     parser.add_argument("--min-soc-range", type=float, default=None, metavar="SPAN",

@@ -21,8 +21,8 @@ class RTCQRConfig:
     # condition's Cap_1C section. Needed when a check ran a normal duration
     # from a full charge but stopped before the discharge finished, which no
     # single-section guard can detect -- only the cross-condition termination
-    # voltage gives it away (see diag40.py). Recorded in results.json so a run
-    # carries the assumption it was produced under.
+    # voltage gives it away. Recorded in results.json so a run carries the
+    # assumption it was produced under.
     capacity_overrides: Dict[float, float] = field(default_factory=dict)
     # Drop segments whose SoC spans less than this. A drive cycle sitting in
     # the saturated full-charge region has a near-constant label while V/I/T
