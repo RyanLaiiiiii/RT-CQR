@@ -37,6 +37,35 @@ LG 18650HG2 Li-ion battery dataset, following:
 pip install -r requirements.txt
 ```
 
+### Running locally (outside Colab)
+
+`run_local.py` chains the whole verify-then-train flow -- install deps,
+get the dataset via kagglehub (or point at a local copy), run the test
+suite, check the reconstructed SoC labels, then train -- as one command on
+a machine with its own Python and GPU, so nothing depends on a Colab
+session's lifetime or its free-tier GPU quota:
+
+```bash
+# Full pipeline, downloading the dataset via kagglehub:
+python run_local.py --train --capacity-override 40:2.75 --min-soc-range 0.02
+
+# Already have a local copy:
+python run_local.py --data-root /path/to/lg_hg2 --train
+
+# Verify only; prints the train.py command instead of running it:
+python run_local.py --data-root /path/to/lg_hg2
+```
+
+It stops at the first failing stage (tests, then label checks) rather than
+spending time training on a broken environment or corrupted labels; pass
+`--force` to proceed anyway. `--skip-install` / `--skip-tests` / `--skip-check`
+skip individual stages. Kaggle API credentials
+(`~/.kaggle/kaggle.json` or `KAGGLE_USERNAME`/`KAGGLE_KEY`) are required
+only when `--data-root` is omitted. Do not carry `--capacity-override
+40:2.75` over to a different copy of the dataset without re-running
+`diag40.py` on it first -- see below for what that value means and why it
+is dataset-specific.
+
 ## Getting the data
 
 ### SoC labels and the capacity denominator
