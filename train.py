@@ -14,6 +14,13 @@ the CQR and WCP calibration baselines using the *same* trained quantile
 model, isolating the effect of violation-weighted time-adaptive
 calibration. Pass --no-ltr to reproduce the "RT-CQR w/o LTR" ablation row
 (Table IV); the "w/o VW-TAC" row is the RT-CQR model with --calibrators cqr.
+
+The default --split-mode fixed follows the paper's protocol: a
+deterministic partition by drive cycle (train Mixed1-8 + UDDS, validate
+LA92, test US06 + HWFET, at -20/-10/0/10/25 degC) with calibration held
+out from validation. --n-seeds repeats the whole pass and reports
+mean +/- std, since a single run's numbers carry the noise of whatever
+landed in the calibration buffer.
 """
 from __future__ import annotations
 
@@ -32,9 +39,11 @@ from torch.utils.data import DataLoader, TensorDataset
 from rtcqr.baselines import make_cqr_calibrator, make_rtcqr_calibrator, make_wcp_calibrator
 from rtcqr.config import RTCQRConfig
 from rtcqr.data import (
+    PAPER_FIXED_CONDITIONS,
     Standardizer,
     _DEFAULT_INCLUDE_PATTERNS,
     chronological_split,
+    fixed_split,
     load_lg_hg2_dataframe,
     make_windows,
     order_chronologically,
@@ -107,19 +116,64 @@ def _report_split_conditions(train, val, calib, test) -> None:
     for name, split in named:
         counts = {c: sum(bf.condition == c for bf in split) for c in conds}
         print(f"{name:<8}" + "".join(f"{counts[c]:>9}" for c in conds))
+    if any(bf.test_section for _, split in named for bf in split):
+        for name, split in named:
+            secs = sorted({bf.test_section for bf in split if bf.test_section})
+            print(f"[rtcqr.train] {name:<6} cycles: {', '.join(secs) if secs else '-'}")
     missing = {bf.condition for bf in test} - {bf.condition for bf in calib}
     if missing:
         print(f"[rtcqr.train] WARNING: condition(s) {sorted(missing, key=str)} appear in test but not in "
               f"calib. Conformal coverage is not guaranteed for those windows.")
 
 
+def _carve_calibration(val_frames, val_calib_fraction: float):
+    """Hold the tail of each validation segment out as the calibration set.
+
+    Sec. IV.B calibrates "on a common subset held out from the validation
+    set". Taking each segment's tail rather than whole segments keeps every
+    ambient condition represented in both halves -- with one validation cycle
+    per temperature, assigning whole segments would leave conditions out of
+    calibration entirely, and a condition that reaches test without reaching
+    calib gets no coverage guarantee at all.
+    """
+    val_model_frames, calib_frames = [], []
+    for bf in val_frames:
+        n_val = len(bf.frame)
+        n_cal = int(round(n_val * val_calib_fraction))
+        val_model_frames.append(replace(bf, frame=bf.frame.iloc[:n_val - n_cal].reset_index(drop=True)))
+        calib_frames.append(replace(bf, frame=bf.frame.iloc[n_val - n_cal:].reset_index(drop=True)))
+    return val_model_frames, calib_frames
+
+
+def _warn_if_calib_unrepresentative(calib_frames, test_frames) -> None:
+    """Flag a calibration set whose SoC distribution does not look like test's.
+
+    Conformal coverage rests on calib and test being exchangeable. Carving
+    calibration from the tail of each validation cycle biases it toward the
+    low-SoC end of that cycle, while test spans whole cycles -- worth seeing
+    rather than inferring later from a large ACE.
+    """
+    calib_soc = np.concatenate([bf.frame["soc"].to_numpy() for bf in calib_frames])
+    test_soc = np.concatenate([bf.frame["soc"].to_numpy() for bf in test_frames])
+    gap = abs(float(calib_soc.mean()) - float(test_soc.mean()))
+    print(f"[rtcqr.train] calib SoC mean={calib_soc.mean():.3f} range=[{calib_soc.min():.3f},"
+          f"{calib_soc.max():.3f}]  test SoC mean={test_soc.mean():.3f} "
+          f"range=[{test_soc.min():.3f},{test_soc.max():.3f}]")
+    if gap > 0.1:
+        print(f"[rtcqr.train] WARNING: calib and test mean SoC differ by {gap:.3f}. Conformal coverage "
+              f"assumes the two are exchangeable, so a gap this size inflates ACE for every calibrator. "
+              f"Lower --val-calib-fraction to keep more of each validation cycle in calibration.")
+
+
 def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include_all: bool = False,
-                   exclude_measurement_ids: Optional[List[str]] = None, split_mode: str = "segment"):
+                   exclude_measurement_ids: Optional[List[str]] = None, split_mode: str = "fixed",
+                   fixed_conditions: Optional[List[float]] = None):
     include_patterns = None if include_all else _DEFAULT_INCLUDE_PATTERNS
     files = load_lg_hg2_dataframe(
         data_root, rated_capacity_ah=cfg.rated_capacity_ah, current_sign=current_sign,
         include_patterns=include_patterns, resample_dt_s=cfg.resample_dt_s,
         capacity_overrides=cfg.capacity_overrides, min_soc_range=cfg.min_soc_range,
+        split_sections=split_mode == "fixed",
     )
 
     if exclude_measurement_ids:
@@ -130,7 +184,13 @@ def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include
 
     print(f"[rtcqr.train] Loaded {len(files)} windowing segment(s) from {data_root}")
 
-    if split_mode == "segment":
+    if split_mode == "fixed":
+        # The paper's protocol (Sec. IV.A/IV.B): a deterministic partition by
+        # drive cycle, with calibration held out from the validation set.
+        train_frames, val_frames, test_frames = fixed_split(
+            files, conditions=fixed_conditions if fixed_conditions is not None else PAPER_FIXED_CONDITIONS)
+        val_model_frames, calib_frames = _carve_calibration(val_frames, cfg.val_calib_fraction)
+    elif split_mode == "segment":
         # Most segments in this dataset are short, single charge/discharge
         # cycles (SoC ~1.0 -> some low point over a few hours). Slicing each
         # one chronologically would systematically give train the high-SoC
@@ -145,13 +205,7 @@ def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include
         )
     else:
         train_frames, val_frames, test_frames = chronological_split(files, cfg.train_frac, cfg.val_frac)
-        # further split each validation segment chronologically into model-val / calibration
-        val_model_frames, calib_frames = [], []
-        for bf in val_frames:
-            n_val = len(bf.frame)
-            n_cal = int(round(n_val * cfg.val_calib_fraction))
-            val_model_frames.append(replace(bf, frame=bf.frame.iloc[:n_val - n_cal].reset_index(drop=True)))
-            calib_frames.append(replace(bf, frame=bf.frame.iloc[n_val - n_cal:].reset_index(drop=True)))
+        val_model_frames, calib_frames = _carve_calibration(val_frames, cfg.val_calib_fraction)
 
     # The conformal time decay (conformal.time_decay_weights) reads buffer
     # position as time, weighting the last entries as "now". Segments arrive
@@ -161,6 +215,7 @@ def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include
     # time-adaptive component would be weighting an essentially random subset.
     calib_frames = order_chronologically(calib_frames)
     _report_split_conditions(train_frames, val_model_frames, calib_frames, test_frames)
+    _warn_if_calib_unrepresentative(calib_frames, test_frames)
 
     X_train, y_train = make_windows(train_frames, cfg.window_size, cfg.stride)
     X_val, y_val = make_windows(val_model_frames, cfg.window_size, cfg.stride)
@@ -369,6 +424,65 @@ def print_results_table(results: Dict, point_lvr: float = None):
             print(f"{name:<10}{m['LVR']:>10.3f}{m['AIW']:>10.3f}{m['ACE']:>10.3f}")
 
 
+def aggregate_runs(per_seed: List[Dict]) -> Dict:
+    """Mean/std/n of each metric across repeated runs.
+
+    Reported as a spread rather than a single number because one run's
+    LVR/AIW/ACE carries the noise of whatever landed in the calibration
+    buffer; with the exponential decay capping the effective calibration
+    count at (1+zeta)/(1-zeta), that noise does not shrink with more data.
+    """
+    agg: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
+    for pi_key in per_seed[0]:
+        agg[pi_key] = {}
+        for method in per_seed[0][pi_key]:
+            agg[pi_key][method] = {}
+            for metric in per_seed[0][pi_key][method]:
+                vals = [run[pi_key][method][metric] for run in per_seed]
+                agg[pi_key][method][metric] = {
+                    "mean": float(np.mean(vals)),
+                    "std": float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0,
+                    "n": len(vals),
+                }
+    return agg
+
+
+def print_aggregate_table(agg: Dict, point_lvrs: Optional[List[float]] = None):
+    n = next(iter(next(iter(agg.values())).values()))["LVR"]["n"]
+    print(f"\n=== LG 18650HG2: mean +/- std over {n} seed(s) (lower is better) ===")
+    for pi_key, per_calib in agg.items():
+        print(f"\n-- {pi_key} PI --")
+        print(f"{'method':<10}{'LVR':>16}{'AIW':>16}{'ACE':>16}")
+        if point_lvrs:
+            cell = f"{np.mean(point_lvrs):.3f}+/-{np.std(point_lvrs, ddof=1) if len(point_lvrs) > 1 else 0.0:.3f}"
+            print(f"{'Point':<10}{cell:>16}{'-':>16}{'-':>16}")
+        for method, metrics in per_calib.items():
+            cells = "".join(f"{m['mean']:.3f}+/-{m['std']:.3f}".rjust(16)
+                            for m in (metrics["LVR"], metrics["AIW"], metrics["ACE"]))
+            print(f"{method:<10}{cells}")
+
+
+def run_once(cfg: RTCQRConfig, data_root: str, args, device: torch.device) -> Tuple[Dict, Optional[float], TCNQuantileNet]:
+    """One full train -> calibrate -> evaluate pass at cfg.seed."""
+    set_seed(cfg.seed)
+    splits = build_windows(cfg, data_root, current_sign=args.current_sign, include_all=args.include_all,
+                           exclude_measurement_ids=args.exclude_measurement_ids, split_mode=args.split_mode,
+                           fixed_conditions=args.fixed_conditions)
+
+    t0 = time.time()
+    model = train_model(cfg, splits, device, num_workers=args.num_workers)
+    print(f"[rtcqr.train] training finished in {time.time() - t0:.1f}s")
+
+    point_lvr = None
+    if args.point_baseline:
+        point_model = train_point_model(cfg, splits, device, num_workers=args.num_workers)
+        point_pred = predict_point(point_model, splits["test"][0], device)
+        point_lvr = lower_violation_rate(splits["test"][1], point_pred, cfg.soc_min)
+
+    results = evaluate(cfg, model, splits, device, calibrators=args.calibrators)
+    return results, point_lvr, model
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data-root", type=str, default=None, help="Path to a local copy of the LG 18650HG2 dataset.")
@@ -381,11 +495,17 @@ def main():
     parser.add_argument("--exclude-measurement-ids", nargs="+", default=None,
                          help="Drop entire Measurement IDs from the windowing segments, "
                               "e.g. --exclude-measurement-ids 590 556")
-    parser.add_argument("--split-mode", choices=["segment", "chronological"], default="segment",
-                         help="'segment' (default) randomly assigns whole segments to train/val/calib/test, "
-                              "appropriate when most segments are short single charge/discharge cycles. "
-                              "'chronological' slices each segment by time, appropriate only when segments are "
-                              "few, long, continuous multi-profile sweeps.")
+    parser.add_argument("--split-mode", choices=["fixed", "segment", "chronological"], default="fixed",
+                         help="'fixed' (default) reproduces the paper's deterministic partition: train on "
+                              "Mixed1-8 + UDDS, validate on LA92, test on US06 + HWFET, over -20/-10/0/10/25 "
+                              "degC, with calibration held out from validation. 'segment' randomly assigns "
+                              "whole segments to train/val/calib/test -- useful for robustness checks, but its "
+                              "results move by 2-4x with the seed on this dataset. 'chronological' slices each "
+                              "segment by time, appropriate only for few, long, continuous sweeps.")
+    parser.add_argument("--fixed-conditions", type=float, nargs="+", default=None, metavar="DEGC",
+                         help="Ambient conditions to keep under --split-mode fixed (default "
+                              "-20 -10 0 10 25, the protocol's five). Pass e.g. --fixed-conditions -20 -10 0 "
+                              "10 25 40 to include 40 degC as well.")
     parser.add_argument("--calibrators", nargs="+", default=["rtcqr", "cqr", "wcp"], choices=["rtcqr", "cqr", "wcp"])
     parser.add_argument("--no-ltr", action="store_true", help="Ablation: disable the lower-tail regularizer (lambda_l=0).")
     parser.add_argument("--max-epochs", type=int, default=None)
@@ -395,6 +515,17 @@ def main():
                          help="Uniform resampling interval in seconds applied to each reconstructed "
                               "measurement run before windowing (default 1.0). Pass 0 to disable resampling.")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--n-seeds", type=int, default=1, metavar="N",
+                         help="Repeat the whole train/calibrate/evaluate pass N times, using seeds "
+                              "--seed, --seed+1, ... and reporting mean +/- std of LVR/AIW/ACE (default 1). "
+                              "Each repeat retrains from scratch, so wall time scales with N. Under "
+                              "--split-mode fixed the partition does not change, so the spread measures "
+                              "training variance; under --split-mode segment it also covers the split.")
+    parser.add_argument("--seeds", type=int, nargs="+", default=None, metavar="S",
+                         help="Explicit list of seeds to repeat over, instead of --seed/--n-seeds.")
+    parser.add_argument("--val-calib-fraction", type=float, default=None, metavar="F",
+                         help="Fraction of each validation segment held out for conformal calibration "
+                              "(default 0.5).")
     parser.add_argument("--output-dir", type=str, default="outputs")
     parser.add_argument("--num-workers", type=int, default=0,
                          help="DataLoader worker processes for batch assembly (default 0). The dataset is "
@@ -424,7 +555,9 @@ def main():
                               "ceil((1-a)(n+1)) order statistic. Reproduces the paper exactly; undercovers.")
     args = parser.parse_args()
 
-    cfg = RTCQRConfig(seed=args.seed)
+    seeds = args.seeds if args.seeds else [args.seed + i for i in range(max(args.n_seeds, 1))]
+
+    cfg = RTCQRConfig(seed=seeds[0])
     cfg.capacity_overrides = parse_capacity_overrides(args.capacity_override)
     if cfg.capacity_overrides:
         print(f"[rtcqr.train] capacity overrides: {cfg.capacity_overrides}")
@@ -444,8 +577,9 @@ def main():
         cfg.window_size = args.window_size
     if args.resample_dt is not None:
         cfg.resample_dt_s = args.resample_dt or None
+    if args.val_calib_fraction is not None:
+        cfg.val_calib_fraction = args.val_calib_fraction
 
-    set_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[rtcqr.train] device={device}")
 
@@ -457,29 +591,49 @@ def main():
             raise SystemExit("Provide --data-root <path> or pass --download to fetch it via kagglehub.")
         data_root = args.data_root
 
-    splits = build_windows(cfg, data_root, current_sign=args.current_sign, include_all=args.include_all,
-                            exclude_measurement_ids=args.exclude_measurement_ids, split_mode=args.split_mode)
-
-    t0 = time.time()
-    model = train_model(cfg, splits, device, num_workers=args.num_workers)
-    print(f"[rtcqr.train] training finished in {time.time() - t0:.1f}s")
-
-    point_lvr = None
-    if args.point_baseline:
-        point_model = train_point_model(cfg, splits, device, num_workers=args.num_workers)
-        y_test = splits["test"][1]
-        point_pred = predict_point(point_model, splits["test"][0], device)
-        point_lvr = lower_violation_rate(y_test, point_pred, cfg.soc_min)
-
-    results = evaluate(cfg, model, splits, device, calibrators=args.calibrators)
-    print_results_table(results, point_lvr=point_lvr)
-
     os.makedirs(args.output_dir, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(args.output_dir, "rtcqr_model.pt"))
+    per_seed: Dict[str, Dict] = {}
+    point_lvrs: List[float] = []
+
+    for i, seed in enumerate(seeds):
+        if len(seeds) > 1:
+            print(f"\n{'=' * 70}\n[rtcqr.train] seed {seed}  ({i + 1}/{len(seeds)})\n{'=' * 70}")
+        run_cfg = replace(cfg, seed=seed)
+        results, point_lvr, model = run_once(run_cfg, data_root, args, device)
+        print_results_table(results, point_lvr=point_lvr)
+
+        per_seed[str(seed)] = {"results": results, "point_lvr": point_lvr}
+        if point_lvr is not None:
+            point_lvrs.append(point_lvr)
+        name = "rtcqr_model.pt" if len(seeds) == 1 else f"rtcqr_model_seed{seed}.pt"
+        torch.save(model.state_dict(), os.path.join(args.output_dir, name))
+
+    runs = [v["results"] for v in per_seed.values()]
+    payload = {
+        "config": asdict(cfg),
+        "split_mode": args.split_mode,
+        "seeds": seeds,
+        # The first seed's raw numbers, so a single-seed run reads exactly as
+        # it did before --n-seeds existed.
+        "results": runs[0],
+        "point_lvr": per_seed[str(seeds[0])]["point_lvr"],
+        "torch_version": torch.__version__,
+    }
+    if len(seeds) > 1:
+        agg = aggregate_runs(runs)
+        print_aggregate_table(agg, point_lvrs=point_lvrs or None)
+        payload["aggregate"] = agg
+        payload["per_seed"] = per_seed
+        if point_lvrs:
+            payload["point_lvr_aggregate"] = {
+                "mean": float(np.mean(point_lvrs)),
+                "std": float(np.std(point_lvrs, ddof=1)) if len(point_lvrs) > 1 else 0.0,
+                "n": len(point_lvrs),
+            }
+
     with open(os.path.join(args.output_dir, "results.json"), "w") as f:
-        json.dump({"config": asdict(cfg), "results": results, "point_lvr": point_lvr,
-                   "torch_version": torch.__version__}, f, indent=2)
-    print(f"[rtcqr.train] saved model and results to {args.output_dir}/")
+        json.dump(payload, f, indent=2)
+    print(f"[rtcqr.train] saved model(s) and results to {args.output_dir}/")
 
 
 if __name__ == "__main__":

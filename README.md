@@ -246,10 +246,91 @@ coverage on a held-out calibration split, and reports LVR / AIW / ACE
 quantile model. Results and the trained weights are written to
 `outputs/results.json` and `outputs/rtcqr_model.pt`.
 
+### Repeating over seeds
+
+```bash
+python train.py --data-root /path/to/lg_hg2 --n-seeds 5
+```
+
+repeats the whole train → calibrate → evaluate pass at seeds 42..46 and
+adds a `mean +/- std` table plus `aggregate` and `per_seed` blocks in
+`results.json` (each seed's weights land in
+`outputs/rtcqr_model_seed<N>.pt`). `--seeds 1 7 13` takes an explicit
+list instead.
+
+Read the spread, not one run. Even with the fixed partition, the
+calibration radius is set by an effective ~99 samples (see below), so
+LVR/AIW/ACE move from seed to seed on weight init alone; under
+`--split-mode segment` they move several-fold. Wall time scales with the
+seed count — each repeat retrains from scratch.
+
+### How these numbers compare with the paper
+
+Table II reports, on this dataset, Point LVR 0.084, and for the 90% PI
+RT-CQR 0.018 / 0.145 / 0.004 against CQR 0.033 / 0.152 / 0.015 and WCP
+0.026 / 0.158 / 0.012. Two structural differences are worth checking
+before reading any gap as a bug:
+
+* **Interval width.** The paper's AIW is ~0.145–0.212; a run here that
+  reports ~0.03 is not "5x better", it is solving an easier problem —
+  usually a split whose test windows share segments (or near-duplicate
+  1 Hz stride-1 neighbours) with training. The fixed protocol tests on
+  cycles the model never trained on, which is what makes the paper's
+  widths the right order of magnitude to compare against.
+* **Coverage error.** ACE around 0.09 with a very small AIW means the
+  intervals are sharp but badly calibrated, the opposite of Table II.
+  Check the calib-vs-test SoC report printed by `train.py` first: a
+  calibration set drawn from a different part of the SoC range than test
+  breaks exchangeability, and no calibrator recovers from that.
+
+The paper does not state `w_l^(0)`, `w_l^(1)`, or `w_u` — Table I lists
+only `lambda_nc`, `lambda_l`, `zeta`, and `gamma`, and eq. (21) only
+requires `w_l^(1) >= w_l^(0) >= w_u >= 0`. The values here (1.5 / 3.0 /
+1.0) are this implementation's choice, so an exact match to Table II's
+AIW should not be expected from them.
+
 ### Train/val/calib/test split
 
-By default (`--split-mode segment`), whole windowing segments are randomly
-assigned to train/val/calib/test, **stratified by ambient temperature**.
+By default (`--split-mode fixed`) the partition is the paper's: Sec. IV.A
+splits the data "following the protocol in [6]" and Sec. IV.B states that
+"all methods follow an identical *fixed* partitioning", i.e. a
+deterministic, cycle-name-based split rather than a random one. For this
+dataset that protocol is:
+
+| split | drive cycles |
+|---|---|
+| train | `Mixed1`–`Mixed8`, `UDDS` |
+| val | `LA92` |
+| test | `US06`, `HWFET` |
+
+over the five ambient conditions −20/−10/0/10/25 °C (`--fixed-conditions`
+to change them). Note 40 °C is outside the protocol, so this dataset's
+truncated 40 °C `Cap_1C` section — and the `--capacity-override 40:2.75`
+that works around it — drops out of the picture entirely under this mode.
+
+Calibration is carved from validation, per Sec. IV.B ("CQR, WCP, and
+RT-CQR are calibrated on a common subset held out from the validation
+set"): the last `--val-calib-fraction` (default 0.5) of each validation
+cycle. Taking each cycle's tail rather than whole cycles keeps every
+temperature present in both halves — with one `LA92` cycle per
+temperature, assigning whole segments would leave conditions out of
+calibration, and a condition that reaches test without reaching calib gets
+no coverage guarantee at all. `train.py` prints both splits' SoC mean and
+range, and warns when they drift more than 0.1 apart, because that gap
+inflates ACE for every calibrator.
+
+#### `--split-mode segment` (random, for robustness checks only)
+
+Whole windowing segments are randomly assigned to train/val/calib/test,
+**stratified by ambient temperature**. This is *not* the paper's protocol
+and its results are strongly seed-dependent on this dataset — measured on
+one trained model, re-drawing the split alone moved RT-CQR's AIW from
+0.028 to 0.106 and its ACE from 0.019 to 0.094 across four seeds, and in
+two of those four seeds the calibration buffer was degenerate enough that
+`rtcqr`, `wcp` (and once `cqr`) returned bit-identical radii. Every
+condition contributes only a handful of segments, so which single segment
+lands in calib dominates the result. Use `--n-seeds` and read the spread,
+never a single random-split run.
 
 Whole segments rather than time slices: most segments here are short single
 charge/discharge cycles whose SoC declines from ~1.0 to some low point.

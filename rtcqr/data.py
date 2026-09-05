@@ -592,17 +592,23 @@ def _resample_uniform(df: pd.DataFrame, dt_s: float) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
-def _split_contiguous(df: pd.DataFrame, keep_mask: np.ndarray, max_gap_s: float) -> List[pd.DataFrame]:
+def _split_contiguous(df: pd.DataFrame, keep_mask: np.ndarray, max_gap_s: float,
+                      break_on: Optional[np.ndarray] = None) -> List[pd.DataFrame]:
     """Split `df` into contiguous runs of kept rows, breaking wherever
     excluded rows sit in between or wherever the real-time gap between
-    consecutive kept rows exceeds `max_gap_s`."""
+    consecutive kept rows exceeds `max_gap_s`.
+
+    `break_on` additionally breaks a run wherever its value changes, so a
+    caller can keep each emitted run within one test section."""
     idx = np.where(keep_mask)[0]
     if len(idx) == 0:
         return []
     time_arr = df["time"].to_numpy()
+    labels = None if break_on is None else np.asarray(break_on)
     segments, start, prev = [], idx[0], idx[0]
     for i in idx[1:]:
-        if i != prev + 1 or (time_arr[i] - time_arr[prev]) > max_gap_s:
+        if (i != prev + 1 or (time_arr[i] - time_arr[prev]) > max_gap_s
+                or (labels is not None and labels[i] != labels[prev])):
             segments.append(df.iloc[start:prev + 1])
             start = i
         prev = i
@@ -622,6 +628,11 @@ class BatteryFile:
     # `segment_split`, which would make "recency" meaningless.
     start_time: Optional[pd.Timestamp] = None
     group_key: Optional[str] = None  # Measurement ID this segment came from
+    # Drive-cycle name (UDDS, LA92, US06, HWFET, Mixed3, ...) this segment
+    # came from. Only populated when the loader was asked to cut segments at
+    # test-section boundaries (`split_sections=True`), which `fixed_split`
+    # needs in order to assign whole cycles to train/val/test by name.
+    test_section: Optional[str] = None
 
 
 def load_lg_hg2_dataframe(
@@ -635,6 +646,7 @@ def load_lg_hg2_dataframe(
     column_overrides: Optional[Dict[str, Dict[str, str]]] = None,
     capacity_overrides: Optional[Dict[float, float]] = None,
     min_soc_range: float = 0.0,
+    split_sections: bool = False,
 ) -> List[BatteryFile]:
     """Load and reconstruct every measurement run under `root` into a list
     of BatteryFile windowing segments. See the module docstring for the
@@ -671,6 +683,12 @@ def load_lg_hg2_dataframe(
     replacing whatever was measured for it. Use it when a condition's Cap_1C
     section is truncated or missing from your copy of the dataset and the
     loader warns about it, e.g. `{40.0: 2.80}`.
+
+    `split_sections` additionally cuts each segment at test-section
+    boundaries and records the section name on each `BatteryFile`, so that
+    `fixed_split` can assign whole drive cycles to train/val/test by name.
+    Off by default: without it, consecutive sections of one measurement stay
+    stitched into a single longer windowing segment.
     """
     column_overrides = column_overrides or {}
     capacity_overrides = capacity_overrides or {}
@@ -785,8 +803,10 @@ def load_lg_hg2_dataframe(
         if not keep_mask.any():
             continue
 
-        for seg in _split_contiguous(combined, keep_mask, max_gap_s):
+        break_on = combined["test_section"].to_numpy() if split_sections else None
+        for seg in _split_contiguous(combined, keep_mask, max_gap_s, break_on=break_on):
             seg_start = seg["abs_time"].iloc[0]
+            seg_section = str(seg["test_section"].iloc[0]) if split_sections else None
             seg = seg[["time", "voltage", "current", "temperature", "soc"]].reset_index(drop=True)
             if resample_dt_s:
                 seg = _resample_uniform(seg, resample_dt_s)
@@ -797,8 +817,8 @@ def load_lg_hg2_dataframe(
                 dropped_degenerate.append((condition, group_key, soc_range))
                 continue
             out.append(BatteryFile(
-                path=f"measurement {group_key} ({section_list})", condition=condition, frame=seg,
-                start_time=seg_start, group_key=str(group_key),
+                path=f"measurement {group_key} ({seg_section or section_list})", condition=condition,
+                frame=seg, start_time=seg_start, group_key=str(group_key), test_section=seg_section,
             ))
 
     if dropped_degenerate:
@@ -959,6 +979,78 @@ def segment_split(
         return [files[i] for i in idx]
 
     return pick(train_idx), pick(val_idx), pick(calib_idx), pick(test_idx)
+
+
+# The fixed partition the paper evaluates on. Sec. IV.A states the data are
+# split "following the protocol in [6]" (Hannan et al., Sci. Rep. 2021) and
+# Sec. IV.B that "all methods follow an identical *fixed* partitioning" --
+# i.e. a deterministic, cycle-name-based split, not a random one. For this
+# dataset that protocol trains on the eight Mixed cycles plus UDDS,
+# validates on LA92, and tests on US06 and HWFET, over the five ambient
+# conditions -20/-10/0/10/25 degC.
+#
+# Two consequences worth knowing before comparing against Table II:
+#   * 40 degC is not part of the protocol, so the truncated 40 degC Cap_1C
+#     section (and its --capacity-override) drops out of the picture here.
+#   * With no random assignment, seed-to-seed variation reflects weight init
+#     and batch order only, not which segments landed in which split.
+PAPER_FIXED_SECTIONS = {
+    "train": ("mixed", "udds"),
+    "val": ("la92",),
+    "test": ("us06", "hwfet"),
+}
+PAPER_FIXED_CONDITIONS = (-20.0, -10.0, 0.0, 10.0, 25.0)
+
+
+def fixed_split(
+    files: Sequence[BatteryFile],
+    sections: Optional[Dict[str, Sequence[str]]] = None,
+    conditions: Optional[Sequence[float]] = None,
+) -> Tuple[List[BatteryFile], List[BatteryFile], List[BatteryFile]]:
+    """Assign whole drive cycles to train/val/test by section name.
+
+    Returns (train, val, test); the caller carves the calibration set out of
+    `val`, since the paper calibrates "on a common subset held out from the
+    validation set" (Sec. IV.B).
+
+    Requires segments loaded with `split_sections=True`, so that each one
+    carries the single `test_section` it came from. Segments whose condition
+    is outside `conditions`, or whose section matches no role, are dropped.
+    """
+    sections = sections or PAPER_FIXED_SECTIONS
+    keep_conditions = None if conditions is None else set(conditions)
+
+    missing_section = [bf for bf in files if bf.test_section is None]
+    if missing_section:
+        raise ValueError(
+            "fixed_split needs per-section segments: load with split_sections=True so each "
+            "BatteryFile carries the drive cycle it came from."
+        )
+
+    buckets: Dict[str, List[BatteryFile]] = {role: [] for role in sections}
+    unassigned: List[str] = []
+    for bf in files:
+        if keep_conditions is not None and bf.condition not in keep_conditions:
+            continue
+        role = next((r for r, pats in sections.items() if _matches_any(bf.test_section, pats)), None)
+        if role is None:
+            unassigned.append(bf.test_section)
+        else:
+            buckets[role].append(bf)
+
+    if unassigned:
+        print(f"[rtcqr.data] fixed split: dropped {len(unassigned)} segment(s) whose section matches no "
+              f"role: {sorted(set(unassigned))}")
+
+    empty = [role for role, v in buckets.items() if not v]
+    if empty:
+        found = sorted({bf.test_section for bf in files if bf.test_section})
+        raise ValueError(
+            f"fixed split left {empty} empty. Expected sections {dict(sections)} over conditions "
+            f"{sorted(keep_conditions) if keep_conditions else 'any'}, but this copy of the dataset only "
+            f"has sections {found}. Either supply the missing cycles or pass --split-mode segment."
+        )
+    return buckets["train"], buckets["val"], buckets["test"]
 
 
 def order_chronologically(files: Sequence[BatteryFile]) -> List[BatteryFile]:
