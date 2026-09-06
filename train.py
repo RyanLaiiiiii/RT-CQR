@@ -117,7 +117,7 @@ def build_windows(cfg: RTCQRConfig, data_root: str, current_sign: float, include
     X_val, y_val = make_windows(val_model_frames, cfg.window_size, cfg.stride)
     calib_stride = cfg.calib_stride or _resolve_calib_stride(calib_frames, cfg)
     X_calib, y_calib = make_windows(calib_frames, cfg.window_size, calib_stride)
-    X_test, y_test = make_windows(test_frames, cfg.window_size, stride=1)
+    X_test, y_test = make_windows(test_frames, cfg.window_size, cfg.test_stride)
 
     scaler = Standardizer(cfg.normalize).fit(X_train)
     X_train, X_val, X_calib, X_test = (scaler.transform(x) for x in (X_train, X_val, X_calib, X_test))
@@ -344,6 +344,9 @@ def main():
                          help="Stride between training/validation windows (default 1). Consecutive "
                               "stride-1 windows overlap by window_size-1 samples, so a larger stride "
                               "cuts epoch cost with little information loss.")
+    parser.add_argument("--test-stride", type=int, default=None,
+                         help="Stride between test windows (default 1). When comparing runs at different "
+                              "--resample-dt, scale this so both predict at the same real-time rate.")
     parser.add_argument("--calib-min-windows", type=int, default=None,
                          help="Target minimum number of calibration windows; the stride is chosen to "
                               "reach it (default 1000). c_alpha resolves no finer than 1/N_cal.")
@@ -371,6 +374,8 @@ def main():
         cfg.calib_stride = args.calib_stride
     if args.calib_min_windows is not None:
         cfg.calib_min_windows = args.calib_min_windows
+    if args.test_stride is not None:
+        cfg.test_stride = args.test_stride
     if args.signed_score:
         cfg.signed_score = True
     if args.train_stride is not None:

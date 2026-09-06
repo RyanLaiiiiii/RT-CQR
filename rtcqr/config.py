@@ -47,6 +47,11 @@ class RTCQRConfig:
     # resolve no better than 1/66 = 0.015 -- too coarse for alpha = 0.05.
     calib_stride: Optional[int] = None
     calib_min_windows: int = 1000
+    # Stride between test windows. 1 = predict at every sample. Set it to
+    # `resample_dt` reciprocal ratios when comparing runs at different
+    # sampling rates, so both issue predictions at the same real-time rate
+    # (stride 1 at 1 Hz and stride 10 at 0.1 s are both one prediction/second).
+    test_stride: int = 1
     train_frac: float = 0.70
     val_frac: float = 0.15
     # test_frac is implicitly 1 - train_frac - val_frac; under the default
