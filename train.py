@@ -435,6 +435,14 @@ def main():
                          help="Stride between training/validation windows (default 1). Consecutive "
                               "stride-1 windows overlap by window_size-1 samples, so a larger stride "
                               "cuts epoch cost with little information loss.")
+    parser.add_argument("--wl0", type=float, default=None,
+                         help="w_l^(0) of eq. (21), the base lower-tail score weight. Table I does not "
+                              "report the omega weights, and c_alpha scales strictly linearly with this "
+                              "one, so it is the direct control on how much calibration widens.")
+    parser.add_argument("--wl1", type=float, default=None,
+                         help="w_l^(1) of eq. (21), the lower-tail weight on violation samples.")
+    parser.add_argument("--wu", type=float, default=None,
+                         help="w_u of eq. (20), the upper-tail weight. Constraint: wl1 >= wl0 >= wu >= 0.")
     parser.add_argument("--eval-only", type=str, default=None,
                          help="Path to a saved rtcqr_model.pt. Skips training and re-runs calibration and "
                               "evaluation on it, so calibration settings (--zeta, --signed-score, "
@@ -495,6 +503,13 @@ def main():
         cfg.test_stride = args.test_stride
     if args.zeta is not None:
         cfg.zeta = args.zeta
+    for name in ("wl0", "wl1", "wu"):
+        value = getattr(args, name)
+        if value is not None:
+            setattr(cfg, name, value)
+    if not (cfg.wl1 >= cfg.wl0 >= cfg.wu >= 0):
+        raise SystemExit(f"eq. (21) requires wl1 >= wl0 >= wu >= 0; got "
+                         f"wl1={cfg.wl1}, wl0={cfg.wl0}, wu={cfg.wu}")
     if args.signed_score:
         cfg.signed_score = True
     if args.train_stride is not None:
