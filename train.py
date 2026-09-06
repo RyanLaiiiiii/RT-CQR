@@ -383,12 +383,13 @@ def print_results_table(results: Dict, point_lvr: float = None):
         # LVR is printed to 5 dp, not the paper's 3: a well-fitted model on this
         # dataset lands around 1e-4, which 3 dp renders as a column of 0.000 and
         # hides the ordering between methods entirely.
-        header = f"{'method':<14}{'LVR':>12}{'AIW':>10}{'ACE':>10}"
+        header = f"{'method':<14}{'LVR':>12}{'AIW':>10}{'ACE':>10}{'coverage':>10}"
         print(header)
         if point_lvr is not None:
-            print(f"{'Point':<14}{point_lvr:>12.5f}{'-':>10}{'-':>10}")
+            print(f"{'Point':<14}{point_lvr:>12.5f}{'-':>10}{'-':>10}{'-':>10}")
         for name, m in per_calib.items():
-            print(f"{name:<14}{m['LVR']:>12.5f}{m['AIW']:>10.3f}{m['ACE']:>10.3f}")
+            print(f"{name:<14}{m['LVR']:>12.5f}{m['AIW']:>10.3f}{m['ACE']:>10.3f}"
+                  f"{m.get('coverage', float('nan')):>10.4f}")
 
 
 def main():
