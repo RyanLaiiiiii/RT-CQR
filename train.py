@@ -42,7 +42,7 @@ from rtcqr.data import (
     segment_split,
 )
 from rtcqr.losses import composite_quantile_loss
-from rtcqr.metrics import lower_violation_rate, summarize
+from rtcqr.metrics import average_interval_width, lower_violation_rate, summarize
 from rtcqr.model import TCNQuantileNet
 
 
@@ -321,7 +321,16 @@ def evaluate(cfg: RTCQRConfig, model: TCNQuantileNet, splits, device, calibrator
 
             calibrator.fit(y_calib, q_calib[:, idx_l], q_calib[:, idx_u])
             lo, hi = calibrator.calibrate_interval(q_test[:, idx_l], q_test[:, idx_u], alpha)
-            results[pi_key][name] = summarize(y_test, lo, hi, alpha, cfg.soc_min)
+            entry = summarize(y_test, lo, hi, alpha, cfg.soc_min)
+            # SoC is physically confined to [0, 1], but the head is unbounded and
+            # c_alpha pushes the lower bound down further, so part of the reported
+            # width can sit below 0 where no SoC can be. AIW over the interval
+            # intersected with [0, 1] says how much of it is reachable. Coverage and
+            # LVR are unchanged by the clip -- a bound below 0 is still below
+            # soc_min, and the truth is inside [0, 1] already.
+            entry["AIW_clipped"] = average_interval_width(np.clip(lo, 0.0, 1.0), np.clip(hi, 0.0, 1.0))
+            entry["frac_width_below_zero"] = float(np.mean(np.clip(-lo, 0.0, None) / np.maximum(hi - lo, 1e-9)))
+            results[pi_key][name] = entry
 
     return results
 
@@ -383,13 +392,16 @@ def print_results_table(results: Dict, point_lvr: float = None):
         # LVR is printed to 5 dp, not the paper's 3: a well-fitted model on this
         # dataset lands around 1e-4, which 3 dp renders as a column of 0.000 and
         # hides the ordering between methods entirely.
-        header = f"{'method':<14}{'LVR':>12}{'AIW':>10}{'ACE':>10}{'coverage':>10}"
+        header = (f"{'method':<14}{'LVR':>12}{'AIW':>10}{'AIW[0,1]':>10}{'ACE':>10}"
+                  f"{'coverage':>10}{'below 0':>9}")
         print(header)
         if point_lvr is not None:
-            print(f"{'Point':<14}{point_lvr:>12.5f}{'-':>10}{'-':>10}{'-':>10}")
+            print(f"{'Point':<14}{point_lvr:>12.5f}{'-':>10}{'-':>10}{'-':>10}{'-':>10}{'-':>9}")
         for name, m in per_calib.items():
-            print(f"{name:<14}{m['LVR']:>12.5f}{m['AIW']:>10.3f}{m['ACE']:>10.3f}"
-                  f"{m.get('coverage', float('nan')):>10.4f}")
+            print(f"{name:<14}{m['LVR']:>12.5f}{m['AIW']:>10.3f}"
+                  f"{m.get('AIW_clipped', float('nan')):>10.3f}{m['ACE']:>10.3f}"
+                  f"{m.get('coverage', float('nan')):>10.4f}"
+                  f"{m.get('frac_width_below_zero', float('nan')) * 100:>8.1f}%")
 
 
 def main():
