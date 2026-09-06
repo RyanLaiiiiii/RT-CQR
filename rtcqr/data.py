@@ -459,6 +459,10 @@ class BatteryFile:
     path: str  # descriptive source label (measurement id / section list), for logging
     condition: Optional[float]  # nominal test temperature in degC, if inferable
     frame: pd.DataFrame  # columns: time, voltage, current, temperature, soc (time-sorted, uniform rate)
+    # Wall-clock start of this segment. Program clocks restart per measurement,
+    # so this is the only key that orders segments from different measurements
+    # against each other -- which eq. (19) requires of the calibration set.
+    start_time: Optional[pd.Timestamp] = None
 
 
 def _measure_reference_capacities(groups: Dict[str, List[dict]]) -> Dict[Optional[float], float]:
@@ -655,12 +659,13 @@ def load_lg_hg2_dataframe(
                       f"{np.std(seg['current'].to_numpy()):.4f} A < {min_current_std_a} A); "
                       f"it recorded only a rest/pause step.")
                 continue
+            seg_start = seg["abs_time"].iloc[0] if "abs_time" in seg else None
             seg = seg[["time", "voltage", "current", "temperature", "soc"]].reset_index(drop=True)
             if resample_dt_s:
                 seg = _resample_uniform(seg, resample_dt_s)
             if len(seg) < 20:
                 continue
-            out.append(BatteryFile(path=label, condition=condition, frame=seg))
+            out.append(BatteryFile(path=label, condition=condition, frame=seg, start_time=seg_start))
 
     if not out:
         raise RuntimeError(
@@ -783,6 +788,14 @@ def drivecycle_split(
     val_idx = order[:n_val]
     calib_idx = order[n_val:n_val + n_calib]
     train_idx = order[n_val + n_calib:]
+
+    # eq. (19) defines the calibration set as "chronologically ordered samples",
+    # and eq. (22)'s zeta^(t-i) is meaningless without that order. Segments are
+    # drawn by a random permutation, so sort the chosen ones by wall-clock start
+    # before they are concatenated -- otherwise "most recent" is arbitrary, and
+    # can even be inverted (measurement 611's Mixed6 ran before its Mixed8, yet
+    # landed after it in the array).
+    calib_idx = sorted(calib_idx, key=lambda i: (pool[i].start_time is None, pool[i].start_time))
 
     print(f"[rtcqr.data] drive-cycle split: test = {len(test)} segment(s) matching "
           f"{list(test_patterns)}; train/val/calib = {len(train_idx)}/{len(val_idx)}/{len(calib_idx)} "

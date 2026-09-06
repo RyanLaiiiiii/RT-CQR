@@ -30,6 +30,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from rtcqr.baselines import make_cqr_calibrator, make_rtcqr_calibrator, make_wcp_calibrator
+from rtcqr.conformal import time_decay_weights
 from rtcqr.config import RTCQRConfig
 from rtcqr.data import (
     Standardizer,
@@ -250,12 +251,49 @@ def report_interval_validity(cfg: RTCQRConfig, q_test: np.ndarray) -> Dict[str, 
     return stats
 
 
+def report_calibration_representativeness(cfg: RTCQRConfig, y_calib: np.ndarray, q_calib: np.ndarray) -> None:
+    """Compare the calibration coverage the calibrator actually sees, under
+    eq. (22)'s zeta-decayed measure, against the pooled coverage.
+
+    c_alpha is read off the *weighted* measure, so when the two disagree the
+    calibrator is deciding from a slice of the calibration set rather than
+    from it as a whole -- and eq. (20)'s clipped score means the visible
+    consequence is only ever c_alpha = 0, which is indistinguishable from
+    "no correction needed". Measured on this dataset once: pooled coverage
+    0.8804 against a zeta-weighted 0.9932, because zeta = 0.98 put 98% of
+    its mass on one of four calibration segments whose per-segment coverage
+    ranged from 0.556 to 0.995.
+
+    The spread is wide here precisely because the intervals are narrow: the
+    model's mean error varies 8x across those segments (0.0046 at 25 degC to
+    0.0382 at -20 degC), so a 0.05-wide interval covers some segments and
+    misses others. Scaling the width to the paper's 0.145 collapses the
+    per-segment spread from 0.439 to 0.000 -- at that width it would not
+    matter which segment the decay landed on.
+    """
+    n = len(y_calib)
+    weights = time_decay_weights(n, cfg.zeta, 0.0, np.zeros(n))
+    ess = float((weights.sum() ** 2) / np.sum(weights ** 2))
+    print("\n[rtcqr.train] calibration set representativeness:")
+    print(f"  N_cal={n}, zeta={cfg.zeta} -> effective sample size {ess:.0f}")
+    for alpha in cfg.pi_alphas:
+        idx_l, idx_u = cfg.quantile_bounds(alpha)
+        covered = (y_calib >= q_calib[:, idx_l]) & (y_calib <= q_calib[:, idx_u])
+        pooled, weighted = float(covered.mean()), float(np.sum(weights * covered))
+        flag = ""
+        if (pooled < 1 - alpha) and (weighted >= 1 - alpha):
+            flag = "  <-- decay HIDES under-coverage; c_alpha will be 0 when widening is needed"
+        print(f"  {int(round((1 - alpha) * 100))}% PI: pooled coverage {pooled:.4f}, "
+              f"zeta-weighted {weighted:.4f}, nominal {1 - alpha:.2f}{flag}")
+
+
 def evaluate(cfg: RTCQRConfig, model: TCNQuantileNet, splits, device, calibrators: List[str]) -> Dict:
     (X_calib, y_calib), (X_test, y_test) = splits["calib"], splits["test"]
     q_calib = predict_quantiles(model, X_calib, device)
     q_test = predict_quantiles(model, X_test, device)
 
     report_interval_validity(cfg, q_test)
+    report_calibration_representativeness(cfg, y_calib, q_calib)
 
     results: Dict[str, Dict[str, Dict[str, float]]] = {}
     for alpha in cfg.pi_alphas:
