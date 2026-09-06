@@ -41,7 +41,7 @@ from rtcqr.data import (
     segment_split,
 )
 from rtcqr.losses import composite_quantile_loss
-from rtcqr.metrics import summarize
+from rtcqr.metrics import lower_violation_rate, summarize
 from rtcqr.model import TCNQuantileNet
 
 
@@ -288,16 +288,69 @@ def evaluate(cfg: RTCQRConfig, model: TCNQuantileNet, splits, device, calibrator
     return results
 
 
+def train_point_model(cfg: RTCQRConfig, splits, device: torch.device) -> TCNQuantileNet:
+    """Table I's `Point*` baseline: the same TCN backbone trained with MSE loss
+    to a single SoC estimate, no interval.
+
+    It anchors the LVR column. LVR asks how often a method declares the cell
+    safe (bound >= SoC_min) while the true SoC is below it, so without a
+    deterministic reference there is nothing to say whether an interval
+    method's LVR is good -- the paper's Point row is 0.084.
+    """
+    X_train, y_train = splits["train"]
+    X_val, y_val = splits["val"]
+    train_loader = DataLoader(TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train)),
+                              batch_size=cfg.batch_size, shuffle=True, drop_last=True)
+    val_loader = DataLoader(TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val)),
+                            batch_size=cfg.batch_size, shuffle=False)
+    model = TCNQuantileNet(
+        in_channels=cfg.in_channels, quantile_levels=[0.5], num_blocks=cfg.num_blocks,
+        channels=cfg.channels, kernel_size=cfg.kernel_size, dropout=cfg.dropout,
+        dilation_base=cfg.dilation_base,
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    best_val, best_state, stale = float("inf"), None, 0
+    for epoch in range(1, cfg.max_epochs + 1):
+        model.train()
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            torch.nn.functional.mse_loss(model(xb).squeeze(-1), yb).backward()
+            optimizer.step()
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                val_loss += torch.nn.functional.mse_loss(model(xb).squeeze(-1), yb).item() * xb.size(0)
+        val_loss /= len(y_val)
+        print(f"[rtcqr.train] point epoch {epoch:03d}  val_mse={val_loss:.6f}")
+        if val_loss < best_val - 1e-9:
+            best_val, stale = val_loss, 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            stale += 1
+            if stale >= cfg.patience:
+                print(f"[rtcqr.train] point baseline early stopping at epoch {epoch}")
+                break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model
+
+
 def print_results_table(results: Dict, point_lvr: float = None):
     print("\n=== LG 18650HG2: LVR / AIW / ACE (lower is better) ===")
     for pi_key, per_calib in results.items():
         print(f"\n-- {pi_key} PI --")
-        header = f"{'method':<14}{'LVR':>10}{'AIW':>10}{'ACE':>10}"
+        # LVR is printed to 5 dp, not the paper's 3: a well-fitted model on this
+        # dataset lands around 1e-4, which 3 dp renders as a column of 0.000 and
+        # hides the ordering between methods entirely.
+        header = f"{'method':<14}{'LVR':>12}{'AIW':>10}{'ACE':>10}"
         print(header)
         if point_lvr is not None:
-            print(f"{'Point':<14}{point_lvr:>10.3f}{'-':>10}{'-':>10}")
+            print(f"{'Point':<14}{point_lvr:>12.5f}{'-':>10}{'-':>10}")
         for name, m in per_calib.items():
-            print(f"{name:<14}{m['LVR']:>10.3f}{m['AIW']:>10.3f}{m['ACE']:>10.3f}")
+            print(f"{name:<14}{m['LVR']:>12.5f}{m['AIW']:>10.3f}{m['ACE']:>10.3f}")
 
 
 def main():
@@ -344,6 +397,9 @@ def main():
                          help="Stride between training/validation windows (default 1). Consecutive "
                               "stride-1 windows overlap by window_size-1 samples, so a larger stride "
                               "cuts epoch cost with little information loss.")
+    parser.add_argument("--point-baseline", action="store_true",
+                         help="Also train Table I's Point* baseline (same backbone, MSE loss) and report "
+                              "its LVR, which is what gives the LVR column a scale.")
     parser.add_argument("--test-stride", type=int, default=None,
                          help="Stride between test windows (default 1). When comparing runs at different "
                               "--resample-dt, scale this so both predict at the same real-time rate.")
@@ -404,8 +460,17 @@ def main():
     model = train_model(cfg, splits, device)
     print(f"[rtcqr.train] training finished in {time.time() - t0:.1f}s")
 
+    point_lvr = None
+    if args.point_baseline:
+        point_model = train_point_model(cfg, splits, device)
+        point_pred = predict_quantiles(point_model, splits["test"][0], device)[:, 0]
+        point_lvr = lower_violation_rate(splits["test"][1], point_pred, cfg.soc_min)
+        print(f"[rtcqr.train] Point baseline LVR = {point_lvr:.5f}")
+
     results = evaluate(cfg, model, splits, device, calibrators=args.calibrators)
-    print_results_table(results)
+    print_results_table(results, point_lvr=point_lvr)
+    if point_lvr is not None:
+        results["point_lvr"] = point_lvr
 
     os.makedirs(args.output_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(args.output_dir, "rtcqr_model.pt"))
