@@ -79,6 +79,15 @@ class RTCQRConfig:
     lambda_l: float = 0.1  # lower-tail regularization weight
 
     # --- Violation-weighted time-adaptive conformal calibration, eq. (19)-(28) ---
+    # Temporal decay factor of eq. (22). Table I gives 0.98, but the value is
+    # only meaningful relative to N_cal: the effective sample size of the
+    # geometric weights is ~(1+zeta)/(1-zeta) = 99 at 0.98, independent of how
+    # large the calibration set is. With N_cal = 1045 spread over four
+    # drive-cycle segments whose per-segment coverage ranges 0.556-0.995, that
+    # decides c_alpha from roughly one segment, and which one is a lottery:
+    # ACE at 90% came out 0.083 chronologically ordered and 0.016 in an
+    # arbitrary order, against 0.007 using the whole set. The paper does not
+    # report its N_cal, so 0.98 cannot be transferred here directly.
     zeta: float = 0.98  # temporal decay factor
     gamma: float = 1.0  # lower-bound-violation emphasis in time weights
     wl0: float = 1.5  # w_l^(0): base lower-tail nonconformity weight

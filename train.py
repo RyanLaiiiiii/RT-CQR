@@ -435,6 +435,11 @@ def main():
                          help="Stride between training/validation windows (default 1). Consecutive "
                               "stride-1 windows overlap by window_size-1 samples, so a larger stride "
                               "cuts epoch cost with little information loss.")
+    parser.add_argument("--zeta", type=float, default=None,
+                         help="Temporal decay factor of eq. (22). Table I gives 0.98, but zeta is only "
+                              "meaningful relative to N_cal: the effective sample size is about "
+                              "(1+zeta)/(1-zeta), so 0.98 decides from ~99 samples whatever N_cal is. "
+                              "Check the representativeness diagnostic before trusting a value.")
     parser.add_argument("--point-baseline", action="store_true",
                          help="Also train Table I's Point* baseline (same backbone, MSE loss) and report "
                               "its LVR, which is what gives the LVR column a scale.")
@@ -470,6 +475,8 @@ def main():
         cfg.calib_min_windows = args.calib_min_windows
     if args.test_stride is not None:
         cfg.test_stride = args.test_stride
+    if args.zeta is not None:
+        cfg.zeta = args.zeta
     if args.signed_score:
         cfg.signed_score = True
     if args.train_stride is not None:
