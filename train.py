@@ -435,6 +435,12 @@ def main():
                          help="Stride between training/validation windows (default 1). Consecutive "
                               "stride-1 windows overlap by window_size-1 samples, so a larger stride "
                               "cuts epoch cost with little information loss.")
+    parser.add_argument("--paper-literal", action="store_true",
+                         help="Reproduce Table II by taking both papers at their word instead of "
+                              "correcting them: the textbook dilation {1,2,4,8} implied by Table I's "
+                              "four kernel-3 blocks, and [6]'s k = 400 window over its 0.1 s raw data. "
+                              "Those combine to a 61-step receptive field spanning 6.1 s, with the "
+                              "other 339 window steps unreachable. See REPRODUCTION.md.")
     parser.add_argument("--zeta", type=float, default=None,
                          help="Temporal decay factor of eq. (22). Table I gives 0.98, but zeta is only "
                               "meaningful relative to N_cal: the effective sample size is about "
@@ -457,6 +463,12 @@ def main():
     args = parser.parse_args()
 
     cfg = RTCQRConfig(seed=args.seed)
+    if args.paper_literal:
+        cfg.dilation_base = 2      # Table I: four kernel-3 blocks, textbook doubling -> field 61
+        cfg.window_size = 400      # [6]: k = 400 timesteps
+        cfg.resample_dt_s = 0.1    # [6] windows the raw 0.1 s data
+        print("[rtcqr.train] --paper-literal: dilation {1,2,4,8}, window 400 @ 0.1s "
+              "-> 6.1s of reachable history (339 of 400 steps outside the receptive field)")
     if args.no_ltr:
         cfg.lambda_l = 0.0
     if args.max_epochs is not None:
