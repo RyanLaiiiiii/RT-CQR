@@ -238,7 +238,18 @@ def _matches_any(text: str, patterns: Sequence[str]) -> bool:
 
 
 def discover_csv_files(root: str) -> List[str]:
-    files = sorted(glob.glob(os.path.join(root, "**", "*.csv"), recursive=True))
+    """Every CSV under `root`, skipping macOS AppleDouble sidecars.
+
+    Unzipping the dataset on (or from) a Mac leaves a parallel `__MACOSX`
+    tree of 207-byte `._<name>.csv` resource forks. They are binary, so they
+    fail parsing and get dropped anyway, but silently -- which looks the same
+    as a real file being dropped. Excluding them by name keeps the skip
+    messages meaningful.
+    """
+    files = [
+        f for f in sorted(glob.glob(os.path.join(root, "**", "*.csv"), recursive=True))
+        if not os.path.basename(f).startswith("._") and "__MACOSX" not in f.split(os.sep)
+    ]
     if not files:
         raise FileNotFoundError(f"No CSV files found under {root!r}.")
     return files
