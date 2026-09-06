@@ -435,6 +435,12 @@ def main():
                          help="Stride between training/validation windows (default 1). Consecutive "
                               "stride-1 windows overlap by window_size-1 samples, so a larger stride "
                               "cuts epoch cost with little information loss.")
+    parser.add_argument("--eval-only", type=str, default=None,
+                         help="Path to a saved rtcqr_model.pt. Skips training and re-runs calibration and "
+                              "evaluation on it, so calibration settings (--zeta, --signed-score, "
+                              "--calib-min-windows) can be swept in seconds instead of retraining. Every "
+                              "other flag must match the run that produced the checkpoint, or the splits "
+                              "and input scaling will not line up.")
     parser.add_argument("--paper-literal", action="store_true",
                          help="Reproduce Table II by taking both papers at their word instead of "
                               "correcting them: the textbook dilation {1,2,4,8} implied by Table I's "
@@ -513,12 +519,25 @@ def main():
     splits = build_windows(cfg, data_root, current_sign=args.current_sign, include_all=args.include_all,
                             exclude_measurement_ids=args.exclude_measurement_ids, split_mode=args.split_mode)
 
-    t0 = time.time()
-    model = train_model(cfg, splits, device)
-    print(f"[rtcqr.train] training finished in {time.time() - t0:.1f}s")
+    if args.eval_only:
+        model = TCNQuantileNet(
+            in_channels=cfg.in_channels, quantile_levels=cfg.quantile_levels,
+            num_blocks=cfg.num_blocks, channels=cfg.channels, kernel_size=cfg.kernel_size,
+            dropout=cfg.dropout, dilation_base=cfg.dilation_base,
+        ).to(device)
+        model.load_state_dict(torch.load(args.eval_only, map_location=device))
+        model.eval()
+        print(f"[rtcqr.train] --eval-only: loaded {args.eval_only}, skipping training "
+              f"(zeta={cfg.zeta}, signed_score={cfg.signed_score})")
+    else:
+        t0 = time.time()
+        model = train_model(cfg, splits, device)
+        print(f"[rtcqr.train] training finished in {time.time() - t0:.1f}s")
 
     point_lvr = None
-    if args.point_baseline:
+    if args.point_baseline and args.eval_only:
+        print("[rtcqr.train] --point-baseline ignored under --eval-only (it needs its own training run)")
+    elif args.point_baseline:
         point_model = train_point_model(cfg, splits, device)
         point_pred = predict_quantiles(point_model, splits["test"][0], device)[:, 0]
         point_lvr = lower_violation_rate(splits["test"][1], point_pred, cfg.soc_min)
@@ -530,7 +549,8 @@ def main():
         results["point_lvr"] = point_lvr
 
     os.makedirs(args.output_dir, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(args.output_dir, "rtcqr_model.pt"))
+    if not args.eval_only:
+        torch.save(model.state_dict(), os.path.join(args.output_dir, "rtcqr_model.pt"))
     with open(os.path.join(args.output_dir, "results.json"), "w") as f:
         json.dump({"config": asdict(cfg), "results": results}, f, indent=2)
     print(f"[rtcqr.train] saved model and results to {args.output_dir}/")
