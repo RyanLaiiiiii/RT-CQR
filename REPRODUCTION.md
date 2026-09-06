@@ -42,6 +42,67 @@ The everything-corrected default reaches RMSE 1.32% / MAE 0.99%, i.e. [6]'s
 level, and correspondingly narrow intervals (AIW 0.041 at 90%). Those numbers
 are *better* than Table II, which is why they do not reproduce it.
 
+### 1.1 What the reproduction reaches
+
+Run above plus `--zeta 0.999` (see §2.5 for why 0.98 does not transfer),
+`--train-stride 10 --test-stride 10`, on an RTX 5060:
+
+| 90% PI | LVR | AIW | ACE | coverage |
+|---|---|---|---|---|
+| paper RT-CQR | 0.018 | **0.145** | 0.004 | — |
+| this RT-CQR | 0.00000 | **0.141** | 0.085 | 0.9846 |
+| paper CQR | 0.033 | 0.152 | 0.015 | — |
+| this CQR | 0.00009 | 0.093 | 0.059 | 0.9594 |
+| paper Point | 0.084 | — | — | — |
+| this Point | 0.01571 | — | — | — |
+
+| 95% PI | LVR | AIW | ACE | coverage |
+|---|---|---|---|---|
+| paper RT-CQR | 0.005 | **0.192** | 0.003 | — |
+| this RT-CQR | 0.00000 | **0.201** | 0.043 | 0.9932 |
+
+**AIW reproduces**, at 97% and 105% of the published values. The remaining
+two columns do not, for reasons that are measurable rather than tunable.
+
+**ACE cannot be matched at the same time as AIW.** Uncalibrated the model
+covers 0.8259 at 90% nominal with AIW 0.065; widened to AIW 0.141 it covers
+0.9846. The width at which it would cover exactly 0.90 is around 0.08-0.09,
+not 0.145. The paper reaches both at once, so its residuals must have a
+markedly heavier tail: at the same interval width it covers 90% where this
+model covers 98.5%. That is a property of the error distribution's shape,
+not its scale, and no amount of degrading the model reproduces it.
+
+**LVR is ~100x smaller** (§2.7), and Point is 0.0157 against the paper's
+0.084.
+
+### 1.2 The method ordering is inverted, and why
+
+| | paper AIW (90%) | this AIW (90%) |
+|---|---|---|
+| CQR | 0.152 | 0.093 |
+| WCP | 0.158 | 0.115 |
+| RT-CQR | **0.145 (narrowest)** | **0.141 (widest)** |
+
+The paper's claim is that RT-CQR is simultaneously the safest (lowest LVR)
+and the tightest. Here it is the widest, and that is structural rather than
+a tuning artifact: all three calibrators share one trained model, so they
+differ only in their scores, and RT-CQR's omega weights (1.5/3.0/1.0)
+inflate its score 1.5x relative to CQR's (1/1/1). A larger score gives a
+larger c_alpha, hence necessarily a wider interval.
+
+Table I says otherwise. Its footnote — "each starred method, the TCN
+backbone has four residual blocks, 64 channels per block, ..." — gives
+CQR*, WCP* and RT-CQR* **each their own backbone**, and only RT-CQR* lists
+the composite-loss weights (lambda_nc = 1.0, lambda_l = 0.1). So in the
+paper RT-CQR is narrower because its *model* is better trained, not because
+its calibration is tighter.
+
+Sharing one model was a deliberate choice here, to isolate the effect of
+violation weighting from the effect of a different backbone. It is the
+right ablation, but it is not Table II's setup, and it cannot reproduce
+Table II's ordering. Reproducing that ordering requires training CQR* and
+WCP* as separate models on the plain pinball loss.
+
 ## 2. Defects found, corrected by default
 
 Every item below was measured on the full six-temperature LG 18650HG2 archive
